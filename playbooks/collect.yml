@@ -1,0 +1,237 @@
+---
+- name: Prepare local result directory
+  hosts: localhost
+  gather_facts: false
+  vars:
+    root_dir: "{{ playbook_dir }}/.."
+    local_result_dir: "{{ root_dir }}/results/{{ benchmark_id }}"
+  tasks:
+    - name: Create local directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ local_result_dir }}"
+        - "{{ local_result_dir }}/raw"
+        - "{{ local_result_dir }}/node-specs"
+
+    - name: Copy target metadata
+      ansible.builtin.copy:
+        src: "{{ root_dir }}/state/current_target.yml"
+        dest: "{{ local_result_dir }}/target.yml"
+        mode: "0644"
+
+    - name: Copy infrastructure metadata
+      ansible.builtin.copy:
+        src: "{{ root_dir }}/state/infrastructure.yml"
+        dest: "{{ local_result_dir }}/infrastructure.yml"
+        mode: "0644"
+
+    - name: Check generated TLS metadata
+      ansible.builtin.stat:
+        path: "{{ root_dir }}/state/tls/metadata.json"
+      register: tls_metadata_file
+
+    - name: Copy generated TLS certificate metadata
+      ansible.builtin.copy:
+        src: "{{ root_dir }}/state/tls/metadata.json"
+        dest: "{{ local_result_dir }}/tls-material.json"
+        mode: "0644"
+      when: tls_metadata_file.stat.exists
+
+    - name: Copy effective benchmark configuration
+      ansible.builtin.copy:
+        content: >-
+          {{
+            {
+              'run_prefix': run_prefix,
+              'metadata': metadata | default({}),
+              'openstack': {
+                'cloud': openstack.cloud,
+                'region_name': openstack.region_name | default(None),
+                'environment_label': openstack.environment_label | default(None),
+                'validate_certs': openstack.validate_certs | default(True)
+              },
+              'network': network,
+              'generator_network': generator_network | default({'mode': 'auto'}),
+              'vm': vm,
+              'backend': backend,
+              'tls': tls | default({}),
+              'benchmark': benchmark | default({}),
+              'scenarios': scenarios | default({}),
+              'locust': locust,
+              'connection_capacity': connection_capacity | default({}),
+              'campaign': campaign | default({}),
+              'metrics': metrics,
+              'octavia': octavia
+            } | to_nice_yaml(indent=2)
+          }}
+        dest: "{{ local_result_dir }}/config-effective.yml"
+        mode: "0644"
+
+- name: Capture per-node hardware and software specification
+  hosts: benchmark_nodes
+  gather_facts: true
+  vars:
+    root_dir: "{{ playbook_dir }}/.."
+    local_node_spec_dir: "{{ root_dir }}/results/{{ benchmark_id }}/node-specs"
+  tasks:
+    - name: Read CPU model
+      ansible.builtin.shell: "grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//'"
+      args:
+        executable: /bin/bash
+      register: cpu_model
+      changed_when: false
+      failed_when: false
+
+    - name: Read Python version
+      ansible.builtin.command: python3 --version
+      register: python_version
+      changed_when: false
+      failed_when: false
+
+    - name: Read nginx version on backends
+      ansible.builtin.command: nginx -v
+      register: nginx_version
+      changed_when: false
+      failed_when: false
+      when: inventory_hostname in groups['backends']
+
+    - name: Read OpenSSL version
+      ansible.builtin.command: openssl version
+      register: openssl_version
+      changed_when: false
+      failed_when: false
+
+    - name: Read Locust version on generators
+      ansible.builtin.command: /opt/octavia-perf/venv/bin/locust --version
+      register: locust_version
+      changed_when: false
+      failed_when: false
+      when: inventory_hostname in (groups['master'] + groups['locust_workers'])
+
+    - name: Read socket listen backlog setting
+      ansible.builtin.command: sysctl -n net.core.somaxconn
+      register: somaxconn
+      changed_when: false
+      failed_when: false
+
+    - name: Read ephemeral source port range
+      ansible.builtin.command: sysctl -n net.ipv4.ip_local_port_range
+      register: ip_local_port_range
+      changed_when: false
+      failed_when: false
+
+    - name: Read system file descriptor ceiling
+      ansible.builtin.command: sysctl -n fs.file-max
+      register: file_max
+      changed_when: false
+      failed_when: false
+
+    - name: Read shell hard file descriptor limit
+      ansible.builtin.shell: "ulimit -Hn"
+      args:
+        executable: /bin/bash
+      register: nofile_hard
+      changed_when: false
+      failed_when: false
+
+    - name: Persist node specification locally
+      ansible.builtin.copy:
+        dest: "{{ local_node_spec_dir }}/{{ inventory_hostname }}.yml"
+        mode: "0644"
+        content: |
+          node: {{ inventory_hostname | to_json }}
+          roles: {{ group_names | sort | to_json }}
+          os:
+            distribution: {{ ansible_facts.distribution | default('unknown') | to_json }}
+            version: {{ ansible_facts.distribution_version | default('unknown') | to_json }}
+            kernel: {{ ansible_facts.kernel | default('unknown') | to_json }}
+            architecture: {{ ansible_facts.architecture | default('unknown') | to_json }}
+            virtualization_type: {{ ansible_facts.virtualization_type | default(None) | to_json }}
+            virtualization_role: {{ ansible_facts.virtualization_role | default(None) | to_json }}
+          cpu:
+            vcpus: {{ ansible_facts.processor_vcpus | default(ansible_facts.processor_count | default(None)) | to_json }}
+            sockets: {{ ansible_facts.processor_count | default(None) | to_json }}
+            cores_per_socket: {{ ansible_facts.processor_cores | default(None) | to_json }}
+            threads_per_core: {{ ansible_facts.processor_threads_per_core | default(None) | to_json }}
+            model: {{ cpu_model.stdout | default('unknown') | to_json }}
+          memory:
+            total_mb: {{ ansible_facts.memtotal_mb | default(None) | to_json }}
+          network:
+            interface: {{ ansible_facts.default_ipv4.interface | default('unknown') | to_json }}
+            private_ip: {{ hostvars[inventory_hostname].private_ip | default(ansible_facts.default_ipv4.address | default(None)) | to_json }}
+            mtu: {{ ansible_facts.default_ipv4.mtu | default(None) | to_json }}
+          software:
+            python: {{ python_version.stdout | default(None) | to_json }}
+            nginx: {{ ((nginx_version.stderr | default(nginx_version.stdout | default(None))) if inventory_hostname in groups['backends'] else None) | to_json }}
+            locust: {{ (locust_version.stdout | default(None) if inventory_hostname in (groups['master'] + groups['locust_workers']) else None) | to_json }}
+            openssl: {{ openssl_version.stdout | default(None) | to_json }}
+          kernel_settings:
+            net.core.somaxconn: {{ somaxconn.stdout | default(None) | to_json }}
+            net.ipv4.ip_local_port_range: {{ ip_local_port_range.stdout | default(None) | to_json }}
+            fs.file-max: {{ file_max.stdout | default(None) | to_json }}
+            nofile_hard: {{ nofile_hard.stdout | default(None) | to_json }}
+      delegate_to: localhost
+
+- name: Fetch Locust result files
+  hosts: master
+  gather_facts: false
+  vars:
+    root_dir: "{{ playbook_dir }}/.."
+  tasks:
+    - name: Fetch master result directory
+      ansible.builtin.fetch:
+        src: "/var/lib/octavia-perf/results/{{ benchmark_id }}/{{ item }}"
+        dest: "{{ root_dir }}/results/{{ benchmark_id }}/raw/master/{{ item }}"
+        flat: true
+      loop:
+        - locust_stats.csv
+        - locust_stats_history.csv
+        - locust_failures.csv
+        - locust_exceptions.csv
+        - locust.log
+        - max-rps-stages.csv
+      failed_when: false
+
+    - name: Fetch master metrics
+      ansible.builtin.fetch:
+        src: "/var/lib/octavia-perf/results/{{ benchmark_id }}/metrics.csv"
+        dest: "{{ root_dir }}/results/{{ benchmark_id }}/raw/master/metrics.csv"
+        flat: true
+
+- name: Fetch node metrics
+  hosts: backends:locust_workers
+  gather_facts: false
+  vars:
+    root_dir: "{{ playbook_dir }}/.."
+  tasks:
+    - name: Fetch metrics CSV
+      ansible.builtin.fetch:
+        src: "/var/lib/octavia-perf/results/{{ benchmark_id }}/metrics.csv"
+        dest: "{{ root_dir }}/results/{{ benchmark_id }}/raw/{{ inventory_hostname }}/metrics.csv"
+        flat: true
+
+- name: Fetch concurrent-connection capacity result files
+  hosts: locust_workers
+  gather_facts: false
+  vars:
+    root_dir: "{{ playbook_dir }}/.."
+    capacity_processes_per_vm: "{{ connection_capacity.processes_per_vm | default(2) | int }}"
+  tasks:
+    - name: Fetch capacity CSVs and logs
+      ansible.builtin.fetch:
+        src: "/var/lib/octavia-perf/results/{{ benchmark_id }}/{{ item.0 }}-p{{ '%02d' | format(item.1) }}{{ item.2 }}"
+        dest: "{{ root_dir }}/results/{{ benchmark_id }}/raw/{{ inventory_hostname }}/{{ item.0 }}-p{{ '%02d' | format(item.1) }}{{ item.2 }}"
+        flat: true
+      loop: "{{ ['connection-capacity', 'connection-latencies', 'connection-errors'] | product(range(0, capacity_processes_per_vm | int) | list, ['.csv']) | list }}"
+      failed_when: false
+
+    - name: Fetch capacity worker logs
+      ansible.builtin.fetch:
+        src: "/var/lib/octavia-perf/results/{{ benchmark_id }}/connection-capacity-p{{ '%02d' | format(item) }}.log"
+        dest: "{{ root_dir }}/results/{{ benchmark_id }}/raw/{{ inventory_hostname }}/connection-capacity-p{{ '%02d' | format(item) }}.log"
+        flat: true
+      loop: "{{ range(0, capacity_processes_per_vm | int) | list }}"
+      failed_when: false

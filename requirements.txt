@@ -1,0 +1,6 @@
+ansible-core>=2.18,<2.20
+openstacksdk>=4.0,<5.0
+locust>=2.46,<2.47
+PyYAML>=6.0,<7.0
+pandas>=2.2,<3.0
+matplotlib>=3.9,<4.0

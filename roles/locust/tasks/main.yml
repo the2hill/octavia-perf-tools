@@ -1,0 +1,47 @@
+---
+- name: Raise generator kernel/network limits
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/99-octavia-perf-generator.conf
+    mode: "0644"
+    content: |
+      fs.file-max = 2097152
+      net.core.somaxconn = 65535
+      net.core.netdev_max_backlog = 250000
+      net.ipv4.ip_local_port_range = 1024 65535
+      net.ipv4.tcp_fin_timeout = 10
+  become: true
+
+- name: Apply generator sysctl settings
+  ansible.builtin.command: sysctl --system
+  changed_when: true
+  become: true
+
+- name: Create Locust virtualenv
+  ansible.builtin.command: python3 -m venv /opt/octavia-perf/venv
+  args:
+    creates: /opt/octavia-perf/venv/bin/python
+  become: true
+
+- name: Install Locust
+  ansible.builtin.pip:
+    name: "locust>=2.46,<2.47"
+    virtualenv: /opt/octavia-perf/venv
+  become: true
+
+- name: Install Locust test plan
+  ansible.builtin.copy:
+    src: locustfile.py
+    dest: /opt/octavia-perf/locustfile.py
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+
+- name: Install concurrent-connection capacity worker
+  ansible.builtin.copy:
+    src: connection_capacity.py
+    dest: /opt/octavia-perf/connection_capacity.py
+    owner: root
+    group: root
+    mode: "0755"
+  become: true

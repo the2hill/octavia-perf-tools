@@ -1,0 +1,604 @@
+---
+# Copy to config/local.yml and edit before use.
+run_prefix: octavia-perf
+
+# Free-form documentation stored with every run. Use these fields for deployment
+# build IDs, maintenance/change references, or notes that are not discoverable via APIs.
+metadata:
+  campaign_label: octavia-flavor-matrix
+  cloud_build: null
+  notes: null
+
+openstack:
+  # Name of a cloud in ~/.config/openstack/clouds.yaml (preferred) or OS_CLOUD.
+  cloud: sjc3
+  region_name: SJC3
+  # Free-form label recorded in every run manifest; it is documentation only.
+  environment_label: api.sjc3.rackspacecloud.com
+  validate_certs: true
+
+network:
+  # true = create an isolated benchmark network/subnet/router.
+  # false = use name/subnet_name below as existing resources.
+  create: true
+  name: octavia-perf-net
+  subnet_name: octavia-perf-subnet
+  router_name: octavia-perf-router
+  cidr: 10.77.0.0/24
+  dns_nameservers:
+    - 1.1.1.1
+    - 8.8.8.8
+  # Must already exist and provide floating IPs / SNAT.
+  external_network: PUBLICNET
+
+# Controls where Locust traffic originates. `auto` is the recommended default:
+#   tenant_vip  -> shared
+#   floating_ip -> dedicated_external
+# Explicit modes:
+#   shared             workers share the backend/LB tenant network (purest VIP test)
+#   dedicated_routed   workers use a separate subnet routed to the tenant VIP
+#   dedicated_external workers use a separate subnet/router and can reach the LB only by FIP
+generator_network:
+  mode: auto
+  # Used only by dedicated_* modes. If false, these resources must already exist.
+  create: true
+  name: octavia-perf-generator-net
+  subnet_name: octavia-perf-generator-subnet
+  router_name: octavia-perf-generator-router
+  cidr: 10.78.0.0/24
+  dns_nameservers:
+    - 1.1.1.1
+    - 8.8.8.8
+
+ssh:
+  user: ubuntu
+  private_key_file: state/octavia-perf-ed25519
+  public_key_file: state/octavia-perf-ed25519.pub
+  keypair_name: octavia-perf-key
+  # Set this to the public CIDR from which you will run Ansible, normally /32.
+  operator_cidr: 203.0.113.10/32
+
+vm:
+  # Exact Glance image name or ID. Ubuntu 24.04 is preferred for reproducibility.
+  image: Ubuntu 24.04 LTS
+  availability_zone: null
+
+  # Sane defaults deliberately overprovision the clients/backends relative to many
+  # Octavia flavor sizes. "auto" selects the smallest available Nova flavor meeting
+  # the minimums; set flavor to an exact name/ID to override.
+  master:
+    flavor: auto
+    min_vcpus: 2
+    min_ram_mb: 4096
+  locust:
+    worker_vms: 4
+    processes_per_vm: 4
+    flavor: auto
+    min_vcpus: 4
+    min_ram_mb: 8192
+  backend:
+    count: 4
+    flavor: auto
+    min_vcpus: 4
+    min_ram_mb: 8192
+
+backend:
+  port: 80
+  tls_port: 443
+  health_path: /healthz
+  # Static payloads are generated once and served from the Linux page cache by nginx.
+  payload_sizes:
+    - 1024
+    - 65536
+    - 1048576
+
+tls:
+  # TLS material is generated locally under state/tls and is never committed.
+  # The frontend PKCS#12 bundle and backend CA are uploaded to Barbican only for
+  # scenarios that require them, then deleted after the load balancer is removed.
+  enabled: true
+  key_bits: 2048
+  ca_key_bits: 4096
+  certificate_days: 3650
+  client_insecure: true
+  backend_protocols:
+    - TLSv1.2
+    - TLSv1.3
+  # Empty/null uses the cloud/provider defaults. These values are applied through
+  # openstacksdk when supported by the provider/API.
+  listener_tls_versions: []
+  listener_tls_ciphers: null
+  pool_tls_versions: []
+  pool_tls_ciphers: null
+
+benchmark:
+  # tenant_vip isolates the Octavia datapath. floating_ip adds the public/FIP path.
+  traffic_path: tenant_vip
+
+locust:
+  # Concurrency staircase. duration_seconds is time spent at that level, not cumulative.
+  stages:
+    - { users: 250,  duration_seconds: 45,  spawn_rate: 250 }
+    - { users: 500,  duration_seconds: 60,  spawn_rate: 250 }
+    - { users: 1000, duration_seconds: 60,  spawn_rate: 500 }
+    - { users: 2000, duration_seconds: 90,  spawn_rate: 500 }
+    - { users: 4000, duration_seconds: 90,  spawn_rate: 1000 }
+    - { users: 8000, duration_seconds: 120, spawn_rate: 1000 }
+  request_timeout_seconds: 10
+  stop_timeout_seconds: 20
+  baseline_direct: true
+
+# Adaptive ceiling search for scenarios with locust_profile: max_rps. The search
+# doubles concurrency until the quality threshold fails, then bisects the last
+# passing/failing user range. Results report max sustainable RPS and the user
+# concurrency that produced it. If max_users passes, the result is a lower bound.
+max_rps:
+  start_users: 500
+  max_users: 64000
+  growth_factor: 2.0
+  spawn_rate: 4000
+  settle_seconds: 10
+  measure_seconds: 45
+  failure_threshold_percent: 1.0
+  p99_max_ms: 1000
+  search_resolution_users: 250
+  max_search_steps: 16
+  user_reach_tolerance_percent: 2.0
+  user_reach_timeout_seconds: 60
+
+# Concurrent-connection capacity tests use a purpose-built asyncio socket holder
+# on the same generator VMs. Targets are GLOBAL across all worker VMs and are
+# divided evenly among them. These tests are separate from Locust RPS/CPS tests.
+connection_capacity:
+  # Capacity workers are separate asyncio processes; 2 per VM uses more than one
+  # CPU core for TLS handshakes while keeping memory/socket accounting simple.
+  processes_per_vm: 2
+  levels:
+    - 1000
+    - 5000
+    - 10000
+    - 25000
+    - 50000
+    - 100000
+  # Used by scenarios with capacity_profile: max. Values are PER GENERATOR VM
+  # and are multiplied by vm.locust.worker_vms at runtime. The final level equals
+  # the default source-port guard, so a fully passing run explicitly means the
+  # generator fleet must be enlarged before claiming an Octavia ceiling.
+  max_levels_per_worker:
+    - 250
+    - 1250
+    - 2500
+    - 6250
+    - 12500
+    - 18750
+    - 25000
+    - 31250
+    - 37500
+    - 43750
+    - 50000
+    - 52500
+    - 55000
+  ramp_seconds: 30
+  hold_seconds: 60
+  heartbeat_seconds: 10
+  inter_level_cooldown_seconds: 10
+  connect_timeout_seconds: 10
+  request_timeout_seconds: 10
+  # Limits concurrent connection/open and heartbeat coroutines per generator VM.
+  open_concurrency_per_worker: 512
+  io_concurrency_per_worker: 1024
+  # A level is considered sustainable only when establishment AND survival
+  # failures each stay at or below this percentage.
+  failure_threshold_percent: 1.0
+  # Idle tests hold sockets without application traffic, then issue a final GET
+  # to prove the socket survived. Active tests send a GET periodically.
+  verify_idle_at_end: true
+  # Abortive close avoids client TIME_WAIT accumulation between independent levels.
+  abortive_close: true
+  tcp_nodelay: true
+  sync_start_delay_seconds: 8
+  # Shell ulimit used by the capacity worker. Kernel fs.file-max is tuned separately.
+  file_descriptor_limit: 1048576
+  # Guard against mistaking client ephemeral-port exhaustion for an Octavia limit.
+  # Raise worker_vms rather than overriding this for high connection targets.
+  source_port_guard_per_worker: 55000
+  allow_source_port_overcommit: false
+
+# Scenarios change one major datapath characteristic at a time. The four core
+# scenarios are enabled by default. The remaining catalog entries are ready for
+# connection-rate, simultaneous-capacity, max-ceiling, and bandwidth campaigns.
+scenarios:
+  enabled:
+    - http_1k_keepalive
+    - tls_passthrough_1k_keepalive
+    - tls_termination_1k_keepalive
+    - tls_termination_reencrypt_1k_keepalive
+  catalog:
+    http_1k_keepalive:
+      description: Plain HTTP request-rate/latency control
+      scheme: http
+      listener_protocol: HTTP
+      listener_port: 80
+      pool_protocol: HTTP
+      member_port: 80
+      health_monitor_type: HTTP
+      benchmark_path: /1024.bin
+      connection_mode: keepalive
+      frontend_tls_termination: false
+      backend_tls: false
+      direct_baseline: true
+
+    tls_passthrough_1k_keepalive:
+      description: End-to-end TLS passthrough; nginx performs TLS
+      scheme: https
+      listener_protocol: HTTPS
+      listener_port: 443
+      pool_protocol: HTTPS
+      member_port: 443
+      health_monitor_type: HTTPS
+      benchmark_path: /1024.bin
+      connection_mode: keepalive
+      frontend_tls_termination: false
+      backend_tls: true
+      direct_baseline: true
+
+    tls_termination_1k_keepalive:
+      description: TLS terminated at Octavia using a Barbican PKCS12 secret
+      scheme: https
+      listener_protocol: TERMINATED_HTTPS
+      listener_port: 443
+      pool_protocol: HTTP
+      member_port: 80
+      health_monitor_type: HTTP
+      benchmark_path: /1024.bin
+      connection_mode: keepalive
+      frontend_tls_termination: true
+      backend_tls: false
+      direct_baseline: false
+
+    tls_termination_reencrypt_1k_keepalive:
+      description: TLS termination plus Octavia-to-member TLS re-encryption and CA validation
+      scheme: https
+      listener_protocol: TERMINATED_HTTPS
+      listener_port: 443
+      pool_protocol: HTTP
+      member_port: 443
+      health_monitor_type: HTTPS
+      benchmark_path: /1024.bin
+      connection_mode: keepalive
+      frontend_tls_termination: true
+      backend_tls: true
+      backend_reencrypt: true
+      direct_baseline: false
+
+    http_1k_connection_churn:
+      description: Plain HTTP with one request per connection for TCP CPS testing
+      scheme: http
+      listener_protocol: HTTP
+      listener_port: 80
+      pool_protocol: HTTP
+      member_port: 80
+      health_monitor_type: HTTP
+      benchmark_path: /1024.bin
+      connection_mode: close
+      frontend_tls_termination: false
+      backend_tls: false
+      direct_baseline: false
+
+    tls_termination_1k_connection_churn:
+      description: TLS termination with one request per connection for handshake/CPS testing
+      scheme: https
+      listener_protocol: TERMINATED_HTTPS
+      listener_port: 443
+      pool_protocol: HTTP
+      member_port: 80
+      health_monitor_type: HTTP
+      benchmark_path: /1024.bin
+      connection_mode: close
+      frontend_tls_termination: true
+      backend_tls: false
+      direct_baseline: false
+
+    http_64k_keepalive:
+      description: HTTP bandwidth/throughput profile with 64 KiB responses
+      scheme: http
+      listener_protocol: HTTP
+      listener_port: 80
+      pool_protocol: HTTP
+      member_port: 80
+      health_monitor_type: HTTP
+      benchmark_path: /65536.bin
+      connection_mode: keepalive
+      frontend_tls_termination: false
+      backend_tls: false
+      direct_baseline: false
+
+    http_1m_keepalive:
+      description: HTTP bandwidth/throughput profile with 1 MiB responses
+      scheme: http
+      listener_protocol: HTTP
+      listener_port: 80
+      pool_protocol: HTTP
+      member_port: 80
+      health_monitor_type: HTTP
+      benchmark_path: /1048576.bin
+      connection_mode: keepalive
+      frontend_tls_termination: false
+      backend_tls: false
+      direct_baseline: false
+
+    tls_termination_64k_keepalive:
+      description: TLS termination bandwidth profile with 64 KiB responses
+      scheme: https
+      listener_protocol: TERMINATED_HTTPS
+      listener_port: 443
+      pool_protocol: HTTP
+      member_port: 80
+      health_monitor_type: HTTP
+      benchmark_path: /65536.bin
+      connection_mode: keepalive
+      frontend_tls_termination: true
+      backend_tls: false
+      direct_baseline: false
+
+    # Adaptive max-sustainable-RPS scenarios use the same datapaths as the core
+    # 1 KiB profiles but switch Locust to the adaptive ceiling-search shape.
+    http_1k_max_rps:
+      description: Find maximum sustainable plain-HTTP request rate
+      locust_profile: max_rps
+      scheme: http
+      listener_protocol: HTTP
+      listener_port: 80
+      pool_protocol: HTTP
+      member_port: 80
+      health_monitor_type: HTTP
+      benchmark_path: /1024.bin
+      connection_mode: keepalive
+      frontend_tls_termination: false
+      backend_tls: false
+      direct_baseline: true
+
+    tls_passthrough_1k_max_rps:
+      description: Find maximum sustainable request rate with TLS passthrough
+      locust_profile: max_rps
+      scheme: https
+      listener_protocol: HTTPS
+      listener_port: 443
+      pool_protocol: HTTPS
+      member_port: 443
+      health_monitor_type: HTTPS
+      benchmark_path: /1024.bin
+      connection_mode: keepalive
+      frontend_tls_termination: false
+      backend_tls: true
+      direct_baseline: true
+
+    tls_termination_1k_max_rps:
+      description: Find maximum sustainable request rate with Octavia TLS termination
+      locust_profile: max_rps
+      scheme: https
+      listener_protocol: TERMINATED_HTTPS
+      listener_port: 443
+      pool_protocol: HTTP
+      member_port: 80
+      health_monitor_type: HTTP
+      benchmark_path: /1024.bin
+      connection_mode: keepalive
+      frontend_tls_termination: true
+      backend_tls: false
+      direct_baseline: false
+
+    tls_termination_reencrypt_1k_max_rps:
+      description: Find maximum sustainable request rate with TLS termination and backend re-encryption
+      locust_profile: max_rps
+      scheme: https
+      listener_protocol: TERMINATED_HTTPS
+      listener_port: 443
+      pool_protocol: HTTP
+      member_port: 443
+      health_monitor_type: HTTPS
+      benchmark_path: /1024.bin
+      connection_mode: keepalive
+      frontend_tls_termination: true
+      backend_tls: true
+      backend_reencrypt: true
+      direct_baseline: false
+
+    # Connection-capacity scenarios use the distributed asyncio holder rather than
+    # Locust. They are intentionally opt-in because each level holds many sockets.
+    http_connection_capacity_idle:
+      description: Maximum simultaneous idle HTTP frontend connections
+      benchmark_engine: connection_capacity
+      capacity_mode: idle
+      scheme: http
+      listener_protocol: HTTP
+      listener_port: 80
+      pool_protocol: HTTP
+      member_port: 80
+      health_monitor_type: HTTP
+      benchmark_path: /1024.bin
+      connection_mode: keepalive
+      frontend_tls_termination: false
+      backend_tls: false
+      direct_baseline: false
+
+    http_connection_capacity_active:
+      description: Maximum simultaneous HTTP keepalive connections with periodic requests
+      benchmark_engine: connection_capacity
+      capacity_mode: active
+      scheme: http
+      listener_protocol: HTTP
+      listener_port: 80
+      pool_protocol: HTTP
+      member_port: 80
+      health_monitor_type: HTTP
+      benchmark_path: /1024.bin
+      connection_mode: keepalive
+      frontend_tls_termination: false
+      backend_tls: false
+      direct_baseline: false
+
+    tls_passthrough_connection_capacity_active:
+      description: Maximum simultaneous active TLS passthrough connections
+      benchmark_engine: connection_capacity
+      capacity_mode: active
+      scheme: https
+      listener_protocol: HTTPS
+      listener_port: 443
+      pool_protocol: HTTPS
+      member_port: 443
+      health_monitor_type: HTTPS
+      benchmark_path: /1024.bin
+      connection_mode: keepalive
+      frontend_tls_termination: false
+      backend_tls: true
+      direct_baseline: false
+
+    tls_termination_connection_capacity_idle:
+      description: Maximum simultaneous idle TLS sessions terminated by Octavia
+      benchmark_engine: connection_capacity
+      capacity_mode: idle
+      scheme: https
+      listener_protocol: TERMINATED_HTTPS
+      listener_port: 443
+      pool_protocol: HTTP
+      member_port: 80
+      health_monitor_type: HTTP
+      benchmark_path: /1024.bin
+      connection_mode: keepalive
+      frontend_tls_termination: true
+      backend_tls: false
+      direct_baseline: false
+
+    tls_termination_connection_capacity_active:
+      description: Maximum simultaneous active TLS sessions terminated by Octavia
+      benchmark_engine: connection_capacity
+      capacity_mode: active
+      scheme: https
+      listener_protocol: TERMINATED_HTTPS
+      listener_port: 443
+      pool_protocol: HTTP
+      member_port: 80
+      health_monitor_type: HTTP
+      benchmark_path: /1024.bin
+      connection_mode: keepalive
+      frontend_tls_termination: true
+      backend_tls: false
+      direct_baseline: false
+
+    tls_termination_reencrypt_connection_capacity_active:
+      description: Maximum simultaneous active TLS sessions with Octavia re-encryption to members
+      benchmark_engine: connection_capacity
+      capacity_mode: active
+      scheme: https
+      listener_protocol: TERMINATED_HTTPS
+      listener_port: 443
+      pool_protocol: HTTP
+      member_port: 443
+      health_monitor_type: HTTPS
+      benchmark_path: /1024.bin
+      connection_mode: keepalive
+      frontend_tls_termination: true
+      backend_tls: true
+      backend_reencrypt: true
+      direct_baseline: false
+
+    # "Max" connection profiles use per-worker levels multiplied by the worker VM
+    # count, ending at the configured source-port guard on every generator VM.
+    http_max_connections_active:
+      description: Drive active HTTP simultaneous connections to the generator-safe ceiling
+      benchmark_engine: connection_capacity
+      capacity_mode: active
+      capacity_profile: max
+      scheme: http
+      listener_protocol: HTTP
+      listener_port: 80
+      pool_protocol: HTTP
+      member_port: 80
+      health_monitor_type: HTTP
+      benchmark_path: /1024.bin
+      connection_mode: keepalive
+      frontend_tls_termination: false
+      backend_tls: false
+      direct_baseline: false
+
+    tls_passthrough_max_connections_active:
+      description: Drive active TLS passthrough connections to the generator-safe ceiling
+      benchmark_engine: connection_capacity
+      capacity_mode: active
+      capacity_profile: max
+      scheme: https
+      listener_protocol: HTTPS
+      listener_port: 443
+      pool_protocol: HTTPS
+      member_port: 443
+      health_monitor_type: HTTPS
+      benchmark_path: /1024.bin
+      connection_mode: keepalive
+      frontend_tls_termination: false
+      backend_tls: true
+      direct_baseline: false
+
+    tls_termination_max_connections_active:
+      description: Drive Octavia-terminated TLS sessions to the generator-safe ceiling
+      benchmark_engine: connection_capacity
+      capacity_mode: active
+      capacity_profile: max
+      scheme: https
+      listener_protocol: TERMINATED_HTTPS
+      listener_port: 443
+      pool_protocol: HTTP
+      member_port: 80
+      health_monitor_type: HTTP
+      benchmark_path: /1024.bin
+      connection_mode: keepalive
+      frontend_tls_termination: true
+      backend_tls: false
+      direct_baseline: false
+
+    tls_termination_reencrypt_max_connections_active:
+      description: Drive terminated and re-encrypted TLS sessions to the generator-safe ceiling
+      benchmark_engine: connection_capacity
+      capacity_mode: active
+      capacity_profile: max
+      scheme: https
+      listener_protocol: TERMINATED_HTTPS
+      listener_port: 443
+      pool_protocol: HTTP
+      member_port: 443
+      health_monitor_type: HTTPS
+      benchmark_path: /1024.bin
+      connection_mode: keepalive
+      frontend_tls_termination: true
+      backend_tls: true
+      backend_reencrypt: true
+      direct_baseline: false
+
+campaign:
+  # Three repeats is the default for comparative work; increase for publication-grade runs.
+  repetitions: 3
+  baseline_repetitions: 1
+  randomize_run_order: true
+  cooldown_seconds: 15
+
+metrics:
+  sample_interval_seconds: 1
+  cpu_warn_percent: 85
+
+# Test these Octavia flavors serially. Use "default" to omit a flavor request and
+# measure the cloud's default. Replace/add names that exist in your environment.
+octavia:
+  flavors:
+    - default
+  lb_algorithm: ROUND_ROBIN
+  # Keep benchmark policy limits above the workload so a configured listener cap
+  # or idle timeout is not mistaken for the Octavia flavor's resource ceiling.
+  listener:
+    connection_limit: 1000000
+    timeout_client_data_ms: 300000
+    timeout_member_data_ms: 300000
+  health_monitor:
+    delay: 5
+    timeout: 3
+    max_retries: 3
+    max_retries_down: 3

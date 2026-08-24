@@ -1,0 +1,177 @@
+---
+- name: Destroy benchmark infrastructure
+  hosts: localhost
+  gather_facts: false
+  vars:
+    root_dir: "{{ playbook_dir }}/.."
+    use_fip: "{{ (benchmark.traffic_path | default('tenant_vip')) == 'floating_ip' }}"
+    resolved_generator_network_mode: >-
+      {{
+        ('dedicated_external' if (benchmark.traffic_path | default('tenant_vip')) == 'floating_ip' else 'shared')
+        if (generator_network.mode | default('auto')) == 'auto'
+        else generator_network.mode
+      }}
+    generator_is_dedicated: "{{ resolved_generator_network_mode != 'shared' }}"
+  tasks:
+    - name: Delete known load balancers for every flavor/scenario combination
+      openstack.cloud.loadbalancer:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ run_prefix }}-{{ item.0 | regex_replace('[^A-Za-z0-9_.-]', '-') }}-{{ item.1 | regex_replace('[^A-Za-z0-9_.-]', '-') }}"
+        delete_floating_ip: "{{ use_fip | bool }}"
+        state: absent
+        wait: true
+        timeout: 900
+      with_nested:
+        - "{{ octavia.flavors }}"
+        - "{{ scenarios.catalog.keys() | list }}"
+      failed_when: false
+
+    - name: Check outstanding per-run Barbican state
+      ansible.builtin.stat:
+        path: "{{ root_dir }}/state/current_secrets.yml"
+      register: secret_state_file
+
+    - name: Load outstanding Barbican references
+      ansible.builtin.include_vars:
+        file: "{{ root_dir }}/state/current_secrets.yml"
+        name: secret_state
+      when: secret_state_file.stat.exists
+
+    - name: Delete outstanding ephemeral Barbican secrets
+      ansible.builtin.command:
+        argv:
+          - "{{ root_dir }}/.venv/bin/python"
+          - "{{ root_dir }}/scripts/barbican_secret.py"
+          - delete
+          - --cloud
+          - "{{ openstack.cloud }}"
+          - --region
+          - "{{ openstack.region_name | default('') }}"
+          - --ref
+          - "{{ item }}"
+      loop: "{{ secret_state.secret_refs | default([]) if secret_state_file.stat.exists else [] }}"
+      changed_when: true
+      failed_when: false
+
+    - name: Delete Locust workers
+      openstack.cloud.server:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ run_prefix }}-locust-{{ '%02d' | format(item) }}"
+        state: absent
+        wait: true
+        timeout: 600
+      loop: "{{ range(1, (vm.locust.worker_vms | int) + 1) | list }}"
+
+    - name: Delete backend servers
+      openstack.cloud.server:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ run_prefix }}-backend-{{ '%02d' | format(item) }}"
+        state: absent
+        wait: true
+        timeout: 600
+      loop: "{{ range(1, (vm.backend.count | int) + 1) | list }}"
+
+    - name: Delete Locust master and its floating IP
+      openstack.cloud.server:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ run_prefix }}-master"
+        delete_ips: true
+        state: absent
+        wait: true
+        timeout: 600
+
+    - name: Delete server groups
+      openstack.cloud.server_group:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ run_prefix }}-backend-aa"
+        - "{{ run_prefix }}-locust-aa"
+
+    - name: Delete security group
+      openstack.cloud.security_group:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ run_prefix }}-sg"
+        state: absent
+
+    - name: Delete external-only generator router
+      openstack.cloud.router:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ generator_network.router_name }}"
+        state: absent
+      when:
+        - resolved_generator_network_mode == 'dedicated_external'
+        - generator_network.create | default(true) | bool
+
+    - name: Remove dedicated-routed generator interface from benchmark router
+      openstack.cloud.router:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ network.router_name }}"
+        network: "{{ network.external_network }}"
+        interfaces:
+          - "{{ network.subnet_name }}"
+        state: present
+      when:
+        - resolved_generator_network_mode == 'dedicated_routed'
+        - generator_network.create | default(true) | bool
+        - network.create | bool
+
+    - name: Delete dedicated generator subnet
+      openstack.cloud.subnet:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ generator_network.subnet_name }}"
+        state: absent
+      when:
+        - generator_is_dedicated | bool
+        - generator_network.create | default(true) | bool
+
+    - name: Delete dedicated generator network
+      openstack.cloud.network:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ generator_network.name }}"
+        state: absent
+      when:
+        - generator_is_dedicated | bool
+        - generator_network.create | default(true) | bool
+
+    - name: Delete router
+      openstack.cloud.router:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ network.router_name }}"
+        state: absent
+      when: network.create | bool
+
+    - name: Delete subnet
+      openstack.cloud.subnet:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ network.subnet_name }}"
+        state: absent
+      when: network.create | bool
+
+    - name: Delete network
+      openstack.cloud.network:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ network.name }}"
+        state: absent
+      when: network.create | bool
+
+    - name: Delete uploaded keypair
+      openstack.cloud.keypair:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ ssh.keypair_name }}"
+        state: absent

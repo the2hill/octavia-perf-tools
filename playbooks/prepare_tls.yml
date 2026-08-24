@@ -1,0 +1,50 @@
+---
+- name: Generate benchmark TLS material
+  hosts: localhost
+  gather_facts: false
+  vars:
+    root_dir: "{{ playbook_dir }}/.."
+  tasks:
+    - name: Skip TLS preparation when disabled
+      ansible.builtin.meta: end_play
+      when: not (tls.enabled | default(false) | bool)
+
+    - name: Read infrastructure state
+      ansible.builtin.include_vars:
+        file: "{{ root_dir }}/state/infrastructure.yml"
+        name: infra
+
+    - name: Require backend addresses for TLS certificate SANs
+      ansible.builtin.assert:
+        that:
+          - infra.backend_private_ips | default([]) | length > 0
+        fail_msg: "Provision infrastructure before preparing TLS material"
+
+    - name: Initialize TLS material command
+      ansible.builtin.set_fact:
+        tls_material_argv:
+          - "{{ root_dir }}/.venv/bin/python"
+          - "{{ root_dir }}/scripts/tls_material.py"
+          - --state-dir
+          - "{{ root_dir }}/state/tls"
+          - --key-bits
+          - "{{ tls.key_bits | default(2048) | string }}"
+          - --ca-key-bits
+          - "{{ tls.ca_key_bits | default(4096) | string }}"
+          - --days
+          - "{{ tls.certificate_days | default(3650) | string }}"
+
+    - name: Add backend addresses to TLS material command
+      ansible.builtin.set_fact:
+        tls_material_argv: "{{ tls_material_argv + ['--backend-ip', item | string] }}"
+      loop: "{{ infra.backend_private_ips }}"
+
+    - name: Generate CA, frontend PKCS12 bundle, and backend certificate
+      ansible.builtin.command:
+        argv: "{{ tls_material_argv }}"
+      register: tls_material
+      changed_when: true
+
+    - name: Print TLS material metadata
+      ansible.builtin.debug:
+        msg: "{{ tls_material.stdout }}"

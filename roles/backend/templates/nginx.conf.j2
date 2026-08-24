@@ -1,0 +1,71 @@
+user www-data;
+worker_processes auto;
+worker_rlimit_nofile 1048576;
+pid /run/nginx.pid;
+
+{% if ansible_facts.os_family == 'Debian' %}
+include /etc/nginx/modules-enabled/*.conf;
+{% endif %}
+
+events {
+    worker_connections 65535;
+    multi_accept on;
+    use epoll;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    access_log off;
+    error_log /var/log/nginx/error.log warn;
+
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    keepalive_requests 100000;
+    reset_timedout_connection on;
+    server_tokens off;
+
+    ssl_session_cache shared:OCTAVIA_PERF:50m;
+    ssl_session_timeout 10m;
+    ssl_session_tickets on;
+{% if tls.enabled | default(false) | bool %}
+    ssl_protocols {{ tls.backend_protocols | default(['TLSv1.2', 'TLSv1.3']) | join(' ') }};
+{% endif %}
+
+    server {
+        listen {{ backend.port }} reuseport backlog=65535;
+        listen [::]:{{ backend.port }} reuseport backlog=65535;
+
+        location = {{ backend.health_path }} {
+            default_type text/plain;
+            return 200 "ok\n";
+        }
+
+        location / {
+            root /var/www/octavia-perf;
+            try_files $uri =404;
+        }
+    }
+
+{% if tls.enabled | default(false) | bool %}
+    server {
+        listen {{ backend.tls_port }} ssl reuseport backlog=65535;
+        listen [::]:{{ backend.tls_port }} ssl reuseport backlog=65535;
+        ssl_certificate /etc/nginx/octavia-perf-tls/backend.crt;
+        ssl_certificate_key /etc/nginx/octavia-perf-tls/backend.key;
+
+        location = {{ backend.health_path }} {
+            default_type text/plain;
+            return 200 "ok\n";
+        }
+
+        location / {
+            root /var/www/octavia-perf;
+            try_files $uri =404;
+        }
+    }
+{% endif %}
+}

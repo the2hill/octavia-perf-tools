@@ -1,0 +1,27 @@
+[master]
+{{ run_prefix }}-master ansible_host={{ master_fip }} private_ip={{ master_generator_ip }} workload_ip={{ master_workload_ip }} generator_ip={{ master_generator_ip }}
+
+[backends]
+{% for s in backend_servers %}
+{{ s.server.name }} ansible_host={{ s.server.addresses[network.name][0].addr }} private_ip={{ s.server.addresses[network.name][0].addr }}
+{% endfor %}
+
+[locust_workers]
+{% for s in locust_servers %}
+{{ s.server.name }} ansible_host={{ s.server.addresses[generator_network_name][0].addr }} private_ip={{ s.server.addresses[generator_network_name][0].addr }}
+{% endfor %}
+
+[benchmark_nodes:children]
+master
+backends
+locust_workers
+
+[all:vars]
+ansible_user={{ ssh.user }}
+ansible_ssh_private_key_file={{ ssh_private_key_abs }}
+
+[backends:vars]
+ansible_ssh_common_args=-o ProxyJump={{ ssh.user }}@{{ master_fip }} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+
+[locust_workers:vars]
+ansible_ssh_common_args=-o ProxyJump={{ ssh.user }}@{{ master_fip }} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null

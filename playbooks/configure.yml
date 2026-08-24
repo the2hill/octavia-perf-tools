@@ -1,0 +1,42 @@
+---
+- name: Configure all benchmark nodes
+  hosts: benchmark_nodes
+  gather_facts: true
+  roles:
+    - common
+
+- name: Stabilize dual-homed Locust master routing
+  hosts: master
+  gather_facts: false
+  tasks:
+    - name: Keep the master default route on its workload/control NIC
+      ansible.builtin.shell: |
+        set -euo pipefail
+        workload_ip={{ workload_ip | quote }}
+        generator_ip={{ generator_ip | quote }}
+        if [ "$workload_ip" = "$generator_ip" ]; then
+          exit 0
+        fi
+        workload_if=$(ip -o -4 addr show | awk -v ip="$workload_ip" '$4 ~ ("^" ip "/") {print $2; exit}')
+        generator_if=$(ip -o -4 addr show | awk -v ip="$generator_ip" '$4 ~ ("^" ip "/") {print $2; exit}')
+        test -n "$workload_if"
+        test -n "$generator_if"
+        ip -4 route show default dev "$workload_if" | grep -q '^default '
+        ip -4 route del default dev "$generator_if" 2>/dev/null || true
+        ip -4 route get 1.1.1.1 | grep -q "src $workload_ip"
+      args:
+        executable: /bin/bash
+      become: true
+      changed_when: workload_ip != generator_ip
+
+- name: Configure native nginx backends
+  hosts: backends
+  gather_facts: true
+  roles:
+    - backend
+
+- name: Configure Locust master and workers
+  hosts: master:locust_workers
+  gather_facts: true
+  roles:
+    - locust

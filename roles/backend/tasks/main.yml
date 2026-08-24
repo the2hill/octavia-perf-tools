@@ -1,0 +1,112 @@
+---
+- name: Install nginx
+  ansible.builtin.package:
+    name: nginx
+    state: present
+  become: true
+
+- name: Raise benchmark kernel/network limits
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/99-octavia-perf.conf
+    mode: "0644"
+    content: |
+      fs.file-max = 2097152
+      net.core.somaxconn = 65535
+      net.core.netdev_max_backlog = 250000
+      net.ipv4.tcp_max_syn_backlog = 65535
+      net.ipv4.ip_local_port_range = 1024 65535
+      net.ipv4.tcp_fin_timeout = 10
+  become: true
+  notify: Restart nginx
+
+- name: Apply sysctl settings
+  ansible.builtin.command: sysctl --system
+  changed_when: true
+  become: true
+
+- name: Create static payload directory
+  ansible.builtin.file:
+    path: /var/www/octavia-perf
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  become: true
+
+- name: Generate static benchmark payloads
+  ansible.builtin.shell: |
+    set -euo pipefail
+    size="{{ item }}"
+    file="/var/www/octavia-perf/${size}.bin"
+    if [ ! -f "$file" ] || [ "$(stat -c %s "$file")" != "$size" ]; then
+      head -c "$size" /dev/zero | tr '\0' 'x' > "$file"
+    fi
+  args:
+    executable: /bin/bash
+  loop: "{{ backend.payload_sizes }}"
+  changed_when: false
+  become: true
+
+- name: Create nginx TLS directory
+  ansible.builtin.file:
+    path: /etc/nginx/octavia-perf-tls
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  become: true
+  when: tls.enabled | default(false) | bool
+
+- name: Install backend TLS certificate
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../state/tls/backend.crt"
+    dest: /etc/nginx/octavia-perf-tls/backend.crt
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  notify: Restart nginx
+  when: tls.enabled | default(false) | bool
+
+- name: Install backend TLS private key
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../state/tls/backend.key"
+    dest: /etc/nginx/octavia-perf-tls/backend.key
+    owner: root
+    group: root
+    mode: "0600"
+  become: true
+  notify: Restart nginx
+  when: tls.enabled | default(false) | bool
+
+- name: Install tuned nginx config
+  ansible.builtin.template:
+    src: nginx.conf.j2
+    dest: /etc/nginx/nginx.conf
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  notify: Restart nginx
+
+- name: Ensure nginx is enabled and running
+  ansible.builtin.service:
+    name: nginx
+    enabled: true
+    state: started
+  become: true
+
+- name: Flush nginx restart before verification
+  ansible.builtin.meta: flush_handlers
+
+- name: Verify backend locally over HTTP
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ backend.port }}{{ backend.health_path }}"
+    status_code: 200
+
+- name: Verify backend locally over HTTPS
+  ansible.builtin.uri:
+    url: "https://127.0.0.1:{{ backend.tls_port }}{{ backend.health_path }}"
+    status_code: 200
+    validate_certs: false
+  when: tls.enabled | default(false) | bool

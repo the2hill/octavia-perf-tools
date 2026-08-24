@@ -1,0 +1,430 @@
+---
+- name: Provision benchmark infrastructure
+  hosts: localhost
+  gather_facts: false
+  vars:
+    root_dir: "{{ playbook_dir }}/.."
+    ssh_private_key_abs: "{{ root_dir }}/{{ ssh.private_key_file }}"
+    ssh_public_key_abs: "{{ root_dir }}/{{ ssh.public_key_file }}"
+    configured_generator_network_mode: "{{ generator_network.mode | default('auto') }}"
+    resolved_generator_network_mode: >-
+      {{
+        ('dedicated_external' if (benchmark.traffic_path | default('tenant_vip')) == 'floating_ip' else 'shared')
+        if (generator_network.mode | default('auto')) == 'auto'
+        else generator_network.mode
+      }}
+    generator_is_dedicated: "{{ resolved_generator_network_mode != 'shared' }}"
+    generator_network_name: "{{ generator_network.name if generator_is_dedicated | bool else network.name }}"
+  tasks:
+    - name: Ensure state directory exists
+      ansible.builtin.file:
+        path: "{{ root_dir }}/state"
+        state: directory
+        mode: "0700"
+
+    - name: Generate SSH key if missing
+      ansible.builtin.command:
+        cmd: "ssh-keygen -q -t ed25519 -N '' -f {{ ssh_private_key_abs }}"
+        creates: "{{ ssh_private_key_abs }}"
+
+    - name: Upload SSH keypair
+      openstack.cloud.keypair:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ ssh.keypair_name }}"
+        public_key_file: "{{ ssh_public_key_abs }}"
+        state: present
+
+    - name: Create benchmark network
+      openstack.cloud.network:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ network.name }}"
+        state: present
+      when: network.create | bool
+
+    - name: Create benchmark subnet
+      openstack.cloud.subnet:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ network.subnet_name }}"
+        network_name: "{{ network.name }}"
+        cidr: "{{ network.cidr }}"
+        ip_version: 4
+        dns_nameservers: "{{ network.dns_nameservers }}"
+        state: present
+      when: network.create | bool
+
+    - name: Create benchmark router
+      openstack.cloud.router:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ network.router_name }}"
+        network: "{{ network.external_network }}"
+        interfaces:
+          - "{{ network.subnet_name }}"
+        state: present
+      when: network.create | bool
+
+    - name: Create dedicated generator network
+      openstack.cloud.network:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ generator_network.name }}"
+        state: present
+      when:
+        - generator_is_dedicated | bool
+        - generator_network.create | default(true) | bool
+
+    - name: Create dedicated generator subnet
+      openstack.cloud.subnet:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ generator_network.subnet_name }}"
+        network_name: "{{ generator_network.name }}"
+        cidr: "{{ generator_network.cidr }}"
+        ip_version: 4
+        dns_nameservers: "{{ generator_network.dns_nameservers | default(network.dns_nameservers) }}"
+        state: present
+      when:
+        - generator_is_dedicated | bool
+        - generator_network.create | default(true) | bool
+
+    - name: Route dedicated generator subnet to tenant VIP network
+      openstack.cloud.router:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ network.router_name }}"
+        network: "{{ network.external_network }}"
+        interfaces:
+          - "{{ network.subnet_name }}"
+          - "{{ generator_network.subnet_name }}"
+        state: present
+      when:
+        - resolved_generator_network_mode == 'dedicated_routed'
+        - generator_network.create | default(true) | bool
+
+    - name: Create external-only generator router
+      openstack.cloud.router:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ generator_network.router_name }}"
+        network: "{{ network.external_network }}"
+        interfaces:
+          - "{{ generator_network.subnet_name }}"
+        state: present
+      when:
+        - resolved_generator_network_mode == 'dedicated_external'
+        - generator_network.create | default(true) | bool
+
+    - name: Create benchmark security group
+      openstack.cloud.security_group:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ run_prefix }}-sg"
+        description: Octavia performance benchmark nodes
+        state: present
+
+    - name: Allow SSH to jump host from operator CIDR
+      openstack.cloud.security_group_rule:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        security_group: "{{ run_prefix }}-sg"
+        protocol: tcp
+        port_range_min: 22
+        port_range_max: 22
+        remote_ip_prefix: "{{ ssh.operator_cidr }}"
+        direction: ingress
+        state: present
+
+    - name: Allow benchmark-network node-to-node TCP
+      openstack.cloud.security_group_rule:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        security_group: "{{ run_prefix }}-sg"
+        protocol: tcp
+        remote_ip_prefix: "{{ network.cidr }}"
+        direction: ingress
+        state: present
+
+    - name: Allow dedicated generator-network TCP
+      openstack.cloud.security_group_rule:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        security_group: "{{ run_prefix }}-sg"
+        protocol: tcp
+        remote_ip_prefix: "{{ generator_network.cidr }}"
+        direction: ingress
+        state: present
+      when: generator_is_dedicated | bool
+
+    - name: Allow Locust web UI from operator CIDR
+      openstack.cloud.security_group_rule:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        security_group: "{{ run_prefix }}-sg"
+        protocol: tcp
+        port_range_min: 8089
+        port_range_max: 8089
+        remote_ip_prefix: "{{ ssh.operator_cidr }}"
+        direction: ingress
+        state: present
+
+    - name: Query master flavor candidates
+      openstack.cloud.compute_flavor_info:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        ram: ">={{ vm.master.min_ram_mb }}"
+        vcpus: ">={{ vm.master.min_vcpus }}"
+      when: vm.master.flavor == 'auto'
+      register: master_flavors
+
+    - name: Query Locust flavor candidates
+      openstack.cloud.compute_flavor_info:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        ram: ">={{ vm.locust.min_ram_mb }}"
+        vcpus: ">={{ vm.locust.min_vcpus }}"
+      when: vm.locust.flavor == 'auto'
+      register: locust_flavors
+
+    - name: Query backend flavor candidates
+      openstack.cloud.compute_flavor_info:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        ram: ">={{ vm.backend.min_ram_mb }}"
+        vcpus: ">={{ vm.backend.min_vcpus }}"
+      when: vm.backend.flavor == 'auto'
+      register: backend_flavors
+
+    - name: Select compute flavors
+      ansible.builtin.set_fact:
+        selected_master_flavor: "{{ vm.master.flavor if vm.master.flavor != 'auto' else (master_flavors.flavors | sort(attribute='ram') | first).name }}"
+        selected_locust_flavor: "{{ vm.locust.flavor if vm.locust.flavor != 'auto' else (locust_flavors.flavors | sort(attribute='ram') | first).name }}"
+        selected_backend_flavor: "{{ vm.backend.flavor if vm.backend.flavor != 'auto' else (backend_flavors.flavors | sort(attribute='ram') | first).name }}"
+
+    - name: Query flavor catalog for resolved metadata
+      openstack.cloud.compute_flavor_info:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+      register: all_flavors_query
+
+    - name: Resolve selected flavor metadata by name or ID
+      ansible.builtin.set_fact:
+        selected_master_flavor_info: "{{ ((((all_flavors_query.flavors | selectattr('name', 'equalto', selected_master_flavor) | list) + (all_flavors_query.flavors | selectattr('id', 'equalto', selected_master_flavor) | list)) | first) | default({}, true)) }}"
+        selected_locust_flavor_info: "{{ ((((all_flavors_query.flavors | selectattr('name', 'equalto', selected_locust_flavor) | list) + (all_flavors_query.flavors | selectattr('id', 'equalto', selected_locust_flavor) | list)) | first) | default({}, true)) }}"
+        selected_backend_flavor_info: "{{ ((((all_flavors_query.flavors | selectattr('name', 'equalto', selected_backend_flavor) | list) + (all_flavors_query.flavors | selectattr('id', 'equalto', selected_backend_flavor) | list)) | first) | default({}, true)) }}"
+
+    - name: Query benchmark image metadata
+      openstack.cloud.image_info:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        image: "{{ vm.image }}"
+      register: benchmark_image_query
+      failed_when: false
+
+    - name: Create backend soft anti-affinity group
+      openstack.cloud.server_group:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ run_prefix }}-backend-aa"
+        policy: soft-anti-affinity
+        state: present
+      register: backend_group
+
+    - name: Create Locust soft anti-affinity group
+      openstack.cloud.server_group:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ run_prefix }}-locust-aa"
+        policy: soft-anti-affinity
+        state: present
+      register: locust_group
+
+    - name: Create Locust master on shared benchmark network
+      openstack.cloud.server:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ run_prefix }}-master"
+        image: "{{ vm.image }}"
+        flavor: "{{ selected_master_flavor }}"
+        network: "{{ network.name }}"
+        key_name: "{{ ssh.keypair_name }}"
+        security_groups:
+          - "{{ run_prefix }}-sg"
+        availability_zone: "{{ vm.availability_zone | default(omit, true) }}"
+        auto_ip: false
+        wait: true
+        timeout: 600
+        state: present
+      when: not (generator_is_dedicated | bool)
+      register: master_server_shared
+
+    - name: Create dual-homed Locust master for dedicated generator network
+      openstack.cloud.server:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ run_prefix }}-master"
+        image: "{{ vm.image }}"
+        flavor: "{{ selected_master_flavor }}"
+        nics:
+          - net-name: "{{ network.name }}"
+          - net-name: "{{ generator_network.name }}"
+        key_name: "{{ ssh.keypair_name }}"
+        security_groups:
+          - "{{ run_prefix }}-sg"
+        availability_zone: "{{ vm.availability_zone | default(omit, true) }}"
+        auto_ip: false
+        wait: true
+        timeout: 600
+        state: present
+      when: generator_is_dedicated | bool
+      register: master_server_dedicated
+
+    - name: Normalize Locust master result
+      ansible.builtin.set_fact:
+        master_server: "{{ master_server_dedicated if generator_is_dedicated | bool else master_server_shared }}"
+
+    - name: Record master network addresses before attaching FIP
+      ansible.builtin.set_fact:
+        master_workload_ip: "{{ master_server.server.addresses[network.name][0].addr }}"
+        master_generator_ip: "{{ master_server.server.addresses[generator_network_name][0].addr }}"
+
+    - name: Attach floating IP to Locust master
+      openstack.cloud.floating_ip:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        server: "{{ run_prefix }}-master"
+        network: "{{ network.external_network }}"
+        nat_destination: "{{ network.name }}"
+        fixed_address: "{{ master_workload_ip }}"
+        reuse: false
+        wait: true
+        state: present
+      register: master_fip_result
+
+    - name: Set master FIP
+      ansible.builtin.set_fact:
+        master_fip: "{{ master_fip_result.floating_ip.floating_ip_address }}"
+
+    - name: Create backend servers
+      openstack.cloud.server:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ run_prefix }}-backend-{{ '%02d' | format(item) }}"
+        image: "{{ vm.image }}"
+        flavor: "{{ selected_backend_flavor }}"
+        network: "{{ network.name }}"
+        key_name: "{{ ssh.keypair_name }}"
+        security_groups:
+          - "{{ run_prefix }}-sg"
+        scheduler_hints:
+          group: "{{ backend_group.server_group.id }}"
+        availability_zone: "{{ vm.availability_zone | default(omit, true) }}"
+        auto_ip: false
+        wait: true
+        timeout: 600
+        state: present
+      loop: "{{ range(1, (vm.backend.count | int) + 1) | list }}"
+      register: backend_servers_result
+
+    - name: Create Locust worker servers
+      openstack.cloud.server:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ run_prefix }}-locust-{{ '%02d' | format(item) }}"
+        image: "{{ vm.image }}"
+        flavor: "{{ selected_locust_flavor }}"
+        network: "{{ generator_network_name }}"
+        key_name: "{{ ssh.keypair_name }}"
+        security_groups:
+          - "{{ run_prefix }}-sg"
+        scheduler_hints:
+          group: "{{ locust_group.server_group.id }}"
+        availability_zone: "{{ vm.availability_zone | default(omit, true) }}"
+        auto_ip: false
+        wait: true
+        timeout: 600
+        state: present
+      loop: "{{ range(1, (vm.locust.worker_vms | int) + 1) | list }}"
+      register: locust_servers_result
+
+    - name: Normalize server result lists
+      ansible.builtin.set_fact:
+        backend_servers: "{{ backend_servers_result.results }}"
+        locust_servers: "{{ locust_servers_result.results }}"
+
+    - name: Render runtime inventory
+      ansible.builtin.template:
+        src: "{{ root_dir }}/templates/inventory.ini.j2"
+        dest: "{{ root_dir }}/state/inventory.ini"
+        mode: "0600"
+
+    - name: Write infrastructure facts
+      ansible.builtin.copy:
+        dest: "{{ root_dir }}/state/infrastructure.yml"
+        mode: "0600"
+        content: |
+          configured_generator_network_mode: {{ configured_generator_network_mode | to_json }}
+          resolved_generator_network_mode: {{ resolved_generator_network_mode | to_json }}
+          generator_network_name: {{ generator_network_name | to_json }}
+          generator_subnet_name: {{ (generator_network.subnet_name if generator_is_dedicated | bool else network.subnet_name) | to_json }}
+          generator_network_cidr: {{ (generator_network.cidr if generator_is_dedicated | bool else network.cidr) | to_json }}
+          generator_network_isolated_from_backends: {{ (resolved_generator_network_mode == 'dedicated_external') | bool | to_json }}
+          direct_backend_reachable: {{ (resolved_generator_network_mode != 'dedicated_external') | bool | to_json }}
+          master_fip: {{ master_fip | to_json }}
+          master_private_ip: {{ master_generator_ip | to_json }}
+          master_workload_ip: {{ master_workload_ip | to_json }}
+          master_generator_ip: {{ master_generator_ip | to_json }}
+          selected_master_flavor: {{ selected_master_flavor | to_json }}
+          selected_locust_flavor: {{ selected_locust_flavor | to_json }}
+          selected_backend_flavor: {{ selected_backend_flavor | to_json }}
+          selected_master_flavor_info: {{ selected_master_flavor_info | to_json }}
+          selected_locust_flavor_info: {{ selected_locust_flavor_info | to_json }}
+          selected_backend_flavor_info: {{ selected_backend_flavor_info | to_json }}
+          image_info: {{ ((benchmark_image_query.images | default([]) | first) | default({}, true)) | to_json }}
+          master_server:
+            name: {{ master_server.server.name | to_json }}
+            id: {{ master_server.server.id | to_json }}
+            private_ip: {{ master_generator_ip | to_json }}
+            workload_ip: {{ master_workload_ip | to_json }}
+            generator_ip: {{ master_generator_ip | to_json }}
+            floating_ip: {{ master_fip | to_json }}
+            availability_zone: {{ master_server.server.availability_zone | default(None) | to_json }}
+            host: {{ master_server.server.host | default(None) | to_json }}
+            hypervisor_hostname: {{ master_server.server.hypervisor_hostname | default(None) | to_json }}
+          backend_servers:
+          {% for s in backend_servers %}
+            - name: {{ s.server.name | to_json }}
+              id: {{ s.server.id | to_json }}
+              private_ip: {{ s.server.addresses[network.name][0].addr | to_json }}
+              network: {{ network.name | to_json }}
+              availability_zone: {{ s.server.availability_zone | default(None) | to_json }}
+              host: {{ s.server.host | default(None) | to_json }}
+              hypervisor_hostname: {{ s.server.hypervisor_hostname | default(None) | to_json }}
+          {% endfor %}
+          locust_servers:
+          {% for s in locust_servers %}
+            - name: {{ s.server.name | to_json }}
+              id: {{ s.server.id | to_json }}
+              private_ip: {{ s.server.addresses[generator_network_name][0].addr | to_json }}
+              network: {{ generator_network_name | to_json }}
+              availability_zone: {{ s.server.availability_zone | default(None) | to_json }}
+              host: {{ s.server.host | default(None) | to_json }}
+              hypervisor_hostname: {{ s.server.hypervisor_hostname | default(None) | to_json }}
+          {% endfor %}
+          backend_private_ips:
+          {% for s in backend_servers %}
+            - {{ s.server.addresses[network.name][0].addr }}
+          {% endfor %}
+          locust_private_ips:
+          {% for s in locust_servers %}
+            - {{ s.server.addresses[generator_network_name][0].addr }}
+          {% endfor %}
+
+    - name: Wait for jump host SSH
+      ansible.builtin.wait_for:
+        host: "{{ master_fip }}"
+        port: 22
+        delay: 2
+        timeout: 300

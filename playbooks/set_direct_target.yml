@@ -1,0 +1,53 @@
+---
+- name: Set direct-backend baseline target
+  hosts: localhost
+  gather_facts: false
+  vars:
+    root_dir: "{{ playbook_dir }}/.."
+    scenario: "{{ scenarios.catalog[scenario_name] }}"
+    direct_scheme: "{{ 'https' if scenario.scheme == 'https' else 'http' }}"
+    direct_port: "{{ backend.tls_port if direct_scheme == 'https' else backend.port }}"
+  tasks:
+    - name: Require backend inventory
+      ansible.builtin.assert:
+        that: groups['backends'] | length > 0
+
+    - name: Persist direct target
+      ansible.builtin.copy:
+        dest: "{{ root_dir }}/state/current_target.yml"
+        mode: "0600"
+        content: |
+          benchmark_id: {{ benchmark_id | to_json }}
+          target_kind: direct
+          scenario_name: {{ scenario_name | to_json }}
+          scenario_description: {{ ('Direct baseline for ' + (scenario.description | default(scenario_name))) | to_json }}
+          traffic_path: direct_backend
+          scheme: {{ direct_scheme | to_json }}
+          benchmark_path: {{ scenario.benchmark_path | to_json }}
+          benchmark_engine: {{ scenario.benchmark_engine | default('locust') | to_json }}
+          locust_profile: {{ scenario.locust_profile | default('staircase') | to_json }}
+          capacity_mode: {{ scenario.capacity_mode | default(None) | to_json }}
+          capacity_profile: {{ scenario.capacity_profile | default('standard') | to_json }}
+          connection_mode: {{ scenario.connection_mode | to_json }}
+          frontend_tls_termination: false
+          backend_tls: {{ (direct_scheme == 'https') | bool | to_json }}
+          backend_reencrypt: false
+          listener_protocol: direct
+          listener_port: {{ direct_port | to_json }}
+          pool_protocol: direct
+          member_port: {{ direct_port | to_json }}
+          health_monitor_type: null
+          octavia_flavor: baseline
+          load_balancer_name: null
+          load_balancer_id: null
+          listener_id: null
+          pool_id: null
+          provider: null
+          flavor_id: null
+          vip_network_id: null
+          vip_subnet_id: null
+          target_host: {{ hostvars[groups['backends'][0]].private_ip | to_json }}
+          target_url: {{ (direct_scheme + '://' + hostvars[groups['backends'][0]].private_ip + ':' + (direct_port | string)) | to_json }}
+          vip_address: null
+          listener_tls_secret_ref: null
+          backend_ca_secret_ref: null

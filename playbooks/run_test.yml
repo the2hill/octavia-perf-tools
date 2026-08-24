@@ -1,0 +1,247 @@
+---
+- name: Load benchmark target
+  hosts: localhost
+  gather_facts: false
+  vars:
+    root_dir: "{{ playbook_dir }}/.."
+  tasks:
+    - name: Read target state
+      ansible.builtin.include_vars:
+        file: "{{ root_dir }}/state/current_target.yml"
+        name: target_state
+
+    - name: Add target state to runtime host
+      ansible.builtin.add_host:
+        name: runtime_target
+        target_state: "{{ target_state }}"
+
+- name: Verify target before benchmark
+  hosts: master
+  gather_facts: false
+  vars:
+    target: "{{ hostvars['runtime_target'].target_state }}"
+  tasks:
+    - name: Wait for target response before benchmark
+      ansible.builtin.uri:
+        url: "{{ target.target_url }}{{ backend.health_path }}"
+        status_code: 200
+        validate_certs: "{{ not (target.scheme == 'https' and (tls.client_insecure | default(true) | bool)) }}"
+      register: target_ready
+      retries: 30
+      delay: 2
+      until: target_ready.status == 200
+
+- name: Start metrics sampling everywhere
+  hosts: benchmark_nodes
+  gather_facts: false
+  vars:
+    remote_result_dir: "/var/lib/octavia-perf/results/{{ hostvars['runtime_target'].target_state.benchmark_id }}"
+  tasks:
+    - name: Create result directory
+      ansible.builtin.file:
+        path: "{{ remote_result_dir }}"
+        state: directory
+        mode: "0755"
+      become: true
+
+    - name: Stop stale metrics sampler
+      ansible.builtin.shell: "pkill -f '[m]etrics_sampler.py' || true"
+      changed_when: false
+      become: true
+
+    - name: Start metrics sampler
+      ansible.builtin.shell: >-
+        nohup /opt/octavia-perf/metrics_sampler.py
+        --output {{ remote_result_dir }}/metrics.csv
+        --interval {{ metrics.sample_interval_seconds }}
+        >/dev/null 2>&1 &
+      changed_when: true
+      become: true
+
+- name: Start distributed Locust workers
+  hosts: locust_workers
+  gather_facts: false
+  vars:
+    master_ip: "{{ hostvars[groups['master'][0]].private_ip }}"
+    target: "{{ hostvars['runtime_target'].target_state }}"
+    max_rps_json: "{{ max_rps | default({}) | to_json }}"
+  tasks:
+    - name: Stop stale worker processes
+      ansible.builtin.shell: "pkill -f '[l]ocust.*--worker' || true"
+      changed_when: false
+      become: true
+      when: (target.benchmark_engine | default('locust')) == 'locust'
+
+    - name: Start worker processes
+      ansible.builtin.shell: |
+        set -euo pipefail
+        export OCTAVIA_PERF_PATH={{ target.benchmark_path | quote }}
+        export OCTAVIA_PERF_TIMEOUT={{ locust.request_timeout_seconds | quote }}
+        export OCTAVIA_PERF_CONNECTION_MODE={{ target.connection_mode | quote }}
+        export OCTAVIA_PERF_LOCUST_PROFILE={{ target.locust_profile | default('staircase') | quote }}
+        export OCTAVIA_PERF_MAX_RPS={{ max_rps_json | quote }}
+        export OCTAVIA_PERF_TLS_INSECURE={{ (tls.client_insecure | default(true) | bool) | ternary('true', 'false') | quote }}
+        nohup /opt/octavia-perf/venv/bin/locust \
+          -f /opt/octavia-perf/locustfile.py \
+          --worker \
+          --master-host {{ master_ip }} \
+          --processes {{ vm.locust.processes_per_vm }} \
+          >/var/log/octavia-perf-worker.log 2>&1 &
+      args:
+        executable: /bin/bash
+      changed_when: true
+      become: true
+      when: (target.benchmark_engine | default('locust')) == 'locust'
+
+- name: Run Locust master headlessly
+  hosts: master
+  gather_facts: false
+  vars:
+    target: "{{ hostvars['runtime_target'].target_state }}"
+    remote_result_dir: "/var/lib/octavia-perf/results/{{ target.benchmark_id }}"
+    total_workers: "{{ (vm.locust.worker_vms | int) * (vm.locust.processes_per_vm | int) }}"
+    stages_json: "{{ locust.stages | to_json }}"
+    max_rps_json: "{{ max_rps | default({}) | to_json }}"
+  tasks:
+    - name: Run Locust master
+      ansible.builtin.shell: |
+        set -euo pipefail
+        export OCTAVIA_PERF_PATH={{ target.benchmark_path | quote }}
+        export OCTAVIA_PERF_STAGES={{ stages_json | quote }}
+        export OCTAVIA_PERF_TIMEOUT={{ locust.request_timeout_seconds | quote }}
+        export OCTAVIA_PERF_CONNECTION_MODE={{ target.connection_mode | quote }}
+        export OCTAVIA_PERF_LOCUST_PROFILE={{ target.locust_profile | default('staircase') | quote }}
+        export OCTAVIA_PERF_MAX_RPS={{ max_rps_json | quote }}
+        export OCTAVIA_PERF_MAX_RPS_OUTPUT={{ (remote_result_dir + '/max-rps-stages.csv') | quote }}
+        export OCTAVIA_PERF_TLS_INSECURE={{ (tls.client_insecure | default(true) | bool) | ternary('true', 'false') | quote }}
+        /opt/octavia-perf/venv/bin/locust \
+          -f /opt/octavia-perf/locustfile.py \
+          --master \
+          --headless \
+          --expect-workers {{ total_workers }} \
+          --host {{ target.target_url | quote }} \
+          --stop-timeout {{ locust.stop_timeout_seconds }} \
+          --csv {{ remote_result_dir }}/locust \
+          --csv-full-history \
+          >{{ remote_result_dir }}/locust.log 2>&1
+      args:
+        executable: /bin/bash
+      become: true
+      changed_when: true
+      when: (target.benchmark_engine | default('locust')) == 'locust'
+
+- name: Prepare synchronized connection-capacity start
+  hosts: localhost
+  gather_facts: false
+  vars:
+    target: "{{ hostvars['runtime_target'].target_state }}"
+  tasks:
+    - name: Set a common future start epoch for all capacity processes
+      ansible.builtin.add_host:
+        name: runtime_target
+        target_state: "{{ target }}"
+        connection_start_epoch: >-
+          {{
+            (lookup('pipe', 'date +%s') | int)
+            + ((connection_capacity | default({})).sync_start_delay_seconds | default(8) | int)
+          }}
+      when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
+
+- name: Run distributed concurrent-connection capacity workers
+  hosts: locust_workers
+  gather_facts: false
+  vars:
+    target: "{{ hostvars['runtime_target'].target_state }}"
+    remote_result_dir: "/var/lib/octavia-perf/results/{{ target.benchmark_id }}"
+    levels_csv: "{{ connection_capacity.levels | map('string') | join(',') }}"
+    max_levels_per_worker_csv: "{{ connection_capacity.max_levels_per_worker | default([]) | map('string') | join(',') }}"
+    capacity_processes_per_vm: "{{ connection_capacity.processes_per_vm | default(2) | int }}"
+    capacity_total_processes: "{{ (vm.locust.worker_vms | int) * (connection_capacity.processes_per_vm | default(2) | int) }}"
+    capacity_vm_index: "{{ groups['locust_workers'].index(inventory_hostname) }}"
+  tasks:
+    - name: Stop stale capacity workers
+      ansible.builtin.shell: "pkill -f '[c]onnection_capacity.py' || true"
+      changed_when: false
+      become: true
+      when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
+
+    - name: Run capacity worker processes
+      ansible.builtin.shell: |
+        set -euo pipefail
+        ulimit -n {{ connection_capacity.file_descriptor_limit | int }}
+        pids=()
+        if [[ {{ (target.capacity_profile | default('standard')) | quote }} == "max" ]]; then
+          levels_csv=$(/usr/bin/python3 -c 'import sys; w=int(sys.argv[1]); print(",".join(str(int(x)*w) for x in sys.argv[2].split(",") if x))' {{ vm.locust.worker_vms | int }} {{ max_levels_per_worker_csv | quote }})
+        else
+          levels_csv={{ levels_csv | quote }}
+        fi
+        vm_index={{ capacity_vm_index | int }}
+        processes={{ capacity_processes_per_vm | int }}
+        total_processes={{ capacity_total_processes | int }}
+        for ((p=0; p<processes; p++)); do
+          shard=$((vm_index * processes + p))
+          prefix=$(printf 'p%02d' "$p")
+          cmd=(
+            /opt/octavia-perf/connection_capacity.py
+            --target-url {{ target.target_url | quote }}
+            --path {{ target.benchmark_path | quote }}
+            --capacity-mode {{ target.capacity_mode | quote }}
+            --levels "$levels_csv"
+            --worker-index "$shard"
+            --worker-count "$total_processes"
+            --ramp-seconds {{ connection_capacity.ramp_seconds | quote }}
+            --hold-seconds {{ connection_capacity.hold_seconds | quote }}
+            --heartbeat-seconds {{ connection_capacity.heartbeat_seconds | quote }}
+            --inter-level-cooldown-seconds {{ connection_capacity.inter_level_cooldown_seconds | quote }}
+            --connect-timeout {{ connection_capacity.connect_timeout_seconds | quote }}
+            --request-timeout {{ connection_capacity.request_timeout_seconds | quote }}
+            --open-concurrency {{ connection_capacity.open_concurrency_per_worker | quote }}
+            --io-concurrency {{ connection_capacity.io_concurrency_per_worker | quote }}
+            --start-epoch {{ hostvars['runtime_target'].connection_start_epoch | quote }}
+            --output-dir {{ remote_result_dir | quote }}
+            --output-prefix "$prefix"
+          )
+          {% if tls.client_insecure | default(true) | bool %}cmd+=(--insecure){% endif %}
+          {% if connection_capacity.abortive_close | default(true) | bool %}cmd+=(--abortive-close){% endif %}
+          {% if connection_capacity.verify_idle_at_end | default(true) | bool %}cmd+=(--verify-idle-at-end){% endif %}
+          {% if connection_capacity.tcp_nodelay | default(true) | bool %}cmd+=(--tcp-nodelay){% endif %}
+          "${cmd[@]}" >{{ remote_result_dir }}/connection-capacity-${prefix}.log 2>&1 &
+          pids+=("$!")
+        done
+        rc=0
+        for pid in "${pids[@]}"; do
+          wait "$pid" || rc=$?
+        done
+        exit "$rc"
+      args:
+        executable: /bin/bash
+      become: true
+      changed_when: true
+      when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
+
+- name: Stop samplers and workers
+  hosts: benchmark_nodes
+  gather_facts: false
+  vars:
+    target: "{{ hostvars['runtime_target'].target_state }}"
+  tasks:
+    - name: Stop metrics sampler
+      ansible.builtin.shell: "pkill -f '[m]etrics_sampler.py' || true"
+      changed_when: false
+      become: true
+
+    - name: Stop Locust worker processes
+      ansible.builtin.shell: "pkill -f '[l]ocust.*--worker' || true"
+      changed_when: false
+      become: true
+      when:
+        - inventory_hostname in groups['locust_workers']
+        - (target.benchmark_engine | default('locust')) == 'locust'
+
+    - name: Stop any remaining capacity workers
+      ansible.builtin.shell: "pkill -f '[c]onnection_capacity.py' || true"
+      changed_when: false
+      become: true
+      when:
+        - inventory_hostname in groups['locust_workers']
+        - (target.benchmark_engine | default('locust')) == 'connection_capacity'

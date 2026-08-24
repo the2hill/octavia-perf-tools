@@ -1,0 +1,104 @@
+---
+- name: Validate OpenStack access and required resources
+  hosts: localhost
+  gather_facts: false
+  vars:
+    root_dir: "{{ playbook_dir }}/.."
+    enabled_scenarios: "{{ scenarios.enabled | default([]) }}"
+    enabled_scenario_defs: "{{ enabled_scenarios | map('extract', scenarios.catalog) | list }}"
+    barbican_required: >-
+      {{
+        (enabled_scenario_defs | selectattr('frontend_tls_termination', 'defined') | selectattr('frontend_tls_termination') | list | length > 0)
+        or
+        (enabled_scenario_defs | selectattr('backend_reencrypt', 'defined') | selectattr('backend_reencrypt') | list | length > 0)
+      }}
+    resolved_generator_network_mode: >-
+      {{
+        ('dedicated_external' if (benchmark.traffic_path | default('tenant_vip')) == 'floating_ip' else 'shared')
+        if (generator_network.mode | default('auto')) == 'auto'
+        else generator_network.mode
+      }}
+  tasks:
+    - name: Authenticate to cloud
+      openstack.cloud.auth:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        validate_certs: "{{ openstack.validate_certs | default(true) }}"
+
+    - name: Check external network
+      openstack.cloud.networks_info:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ network.external_network }}"
+      register: ext_net
+
+    - name: Require external network
+      ansible.builtin.assert:
+        that: ext_net.networks | length == 1
+        fail_msg: "Expected exactly one external network named {{ network.external_network }}"
+
+    - name: Check pre-existing dedicated generator network
+      openstack.cloud.networks_info:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ generator_network.name }}"
+      register: existing_generator_net
+      when:
+        - resolved_generator_network_mode != 'shared'
+        - not (generator_network.create | default(true) | bool)
+
+    - name: Require pre-existing dedicated generator network
+      ansible.builtin.assert:
+        that: existing_generator_net.networks | length == 1
+        fail_msg: "Expected exactly one existing generator network named {{ generator_network.name }}"
+      when:
+        - resolved_generator_network_mode != 'shared'
+        - not (generator_network.create | default(true) | bool)
+
+    - name: Verify Barbican/key-manager endpoint for TLS termination scenarios
+      ansible.builtin.command:
+        argv:
+          - "{{ root_dir }}/.venv/bin/python"
+          - "{{ root_dir }}/scripts/barbican_secret.py"
+          - probe
+          - --cloud
+          - "{{ openstack.cloud }}"
+          - --region
+          - "{{ openstack.region_name | default('') }}"
+      changed_when: false
+      when: barbican_required | bool
+
+    - name: Query candidate master flavors
+      openstack.cloud.compute_flavor_info:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        ram: ">={{ vm.master.min_ram_mb }}"
+        vcpus: ">={{ vm.master.min_vcpus }}"
+      when: vm.master.flavor == 'auto'
+      register: master_flavors
+
+    - name: Query candidate Locust flavors
+      openstack.cloud.compute_flavor_info:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        ram: ">={{ vm.locust.min_ram_mb }}"
+        vcpus: ">={{ vm.locust.min_vcpus }}"
+      when: vm.locust.flavor == 'auto'
+      register: locust_flavors
+
+    - name: Query candidate backend flavors
+      openstack.cloud.compute_flavor_info:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        ram: ">={{ vm.backend.min_ram_mb }}"
+        vcpus: ">={{ vm.backend.min_vcpus }}"
+      when: vm.backend.flavor == 'auto'
+      register: backend_flavors
+
+    - name: Verify auto flavor candidates exist
+      ansible.builtin.assert:
+        that:
+          - vm.master.flavor != 'auto' or (master_flavors.flavors | length > 0)
+          - vm.locust.flavor != 'auto' or (locust_flavors.flavors | length > 0)
+          - vm.backend.flavor != 'auto' or (backend_flavors.flavors | length > 0)
+        fail_msg: "No Nova flavor satisfies one or more configured vCPU/RAM minimums"
