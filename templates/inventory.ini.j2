@@ -19,9 +19,11 @@ locust_workers
 [all:vars]
 ansible_user={{ ssh.user }}
 ansible_ssh_private_key_file={{ ssh_private_key_abs }}
+ansible_ssh_retries={{ ssh.retries | default(5) }}
 
 [backends:vars]
-ansible_ssh_common_args=-o ProxyJump={{ ssh.user }}@{{ master_fip }} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+ansible_ssh_common_args=-o ProxyCommand="ssh -i {{ ssh_private_key_abs }} -o IdentitiesOnly=yes -o ConnectTimeout={{ ssh.connect_timeout_seconds | default(10) }} -o ConnectionAttempts=3 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -W %h:%p {{ ssh.user }}@{{ master_fip }}" -o IdentitiesOnly=yes -o ConnectTimeout={{ ssh.connect_timeout_seconds | default(10) }} -o ConnectionAttempts=3 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
 
 [locust_workers:vars]
-ansible_ssh_common_args=-o ProxyJump={{ ssh.user }}@{{ master_fip }} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+ansible_ssh_common_args=-o ProxyCommand="ssh -i {{ ssh_private_key_abs }} -o IdentitiesOnly=yes -o ConnectTimeout={{ ssh.connect_timeout_seconds | default(10) }} -o ConnectionAttempts=3 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -W %h:%p {{ ssh.user }}@{{ master_fip }}" -o IdentitiesOnly=yes -o ConnectTimeout={{ ssh.connect_timeout_seconds | default(10) }} -o ConnectionAttempts=3 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+

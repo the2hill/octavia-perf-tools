@@ -1,0 +1,55 @@
+---
+- name: Check persisted infrastructure state
+  ansible.builtin.stat:
+    path: "{{ root_dir }}/state/infrastructure.yml"
+  register: controller_route_infra_state
+
+- name: Read persisted infrastructure state
+  ansible.builtin.include_vars:
+    file: "{{ root_dir }}/state/infrastructure.yml"
+    name: controller_route_infra
+  when: controller_route_infra_state.stat.exists
+
+- name: Reconcile controller route to current master FIP
+  ansible.builtin.command:
+    argv:
+      - "{{ root_dir }}/scripts/controller_fip_route.py"
+      - ensure
+      - --destination
+      - "{{ controller_route_infra.master_fip }}"
+      - --mtu
+      - "{{ controller_route_infra.controller_fip_route_mtu | default(controller_route_infra.external_network_mtu | default(1500)) | string }}"
+      - --state-file
+      - "{{ root_dir }}/state/controller-fip-route.json"
+  become: true
+  register: controller_master_route_reconcile
+  changed_when: true
+  when:
+    - controller_route_infra_state.stat.exists
+    - ssh.manage_controller_fip_route | default(true) | bool
+    - controller_route_infra.controller_fip_route_managed | default(true) | bool
+    - controller_route_infra.master_fip | default('') | length > 0
+
+- name: Verify controller route to current master FIP
+  ansible.builtin.command:
+    argv:
+      - ip
+      - -4
+      - route
+      - get
+      - "{{ controller_route_infra.master_fip }}"
+  register: controller_master_route_verify
+  changed_when: false
+  when:
+    - controller_route_infra_state.stat.exists
+    - ssh.manage_controller_fip_route | default(true) | bool
+    - controller_route_infra.controller_fip_route_managed | default(true) | bool
+    - controller_route_infra.master_fip | default('') | length > 0
+
+- name: Show reconciled controller route
+  ansible.builtin.debug:
+    msg: "{{ controller_master_route_verify.stdout }}"
+  when:
+    - controller_master_route_verify is defined
+    - controller_master_route_verify.stdout is defined
+

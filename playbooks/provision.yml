@@ -6,6 +6,7 @@
     root_dir: "{{ playbook_dir }}/.."
     ssh_private_key_abs: "{{ root_dir }}/{{ ssh.private_key_file }}"
     ssh_public_key_abs: "{{ root_dir }}/{{ ssh.public_key_file }}"
+    controller_route_state_abs: "{{ root_dir }}/state/controller-fip-route.json"
     configured_generator_network_mode: "{{ generator_network.mode | default('auto') }}"
     resolved_generator_network_mode: >-
       {{
@@ -307,6 +308,51 @@
       ansible.builtin.set_fact:
         master_fip: "{{ master_fip_result.floating_ip.floating_ip_address }}"
 
+    - name: Query external network MTU for controller FIP path
+      openstack.cloud.networks_info:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ network.external_network }}"
+      register: controller_external_network
+
+    - name: Resolve external and controller FIP route MTUs
+      ansible.builtin.set_fact:
+        external_network_mtu: "{{ controller_external_network.networks[0].mtu | default(1500, true) | int }}"
+        controller_fip_route_mtu: >-
+          {{
+            (controller_external_network.networks[0].mtu | default(1500, true) | int)
+            if (ssh.controller_fip_mtu | default('auto') | string) == 'auto'
+            else (ssh.controller_fip_mtu | int)
+          }}
+
+    - name: Require a sane controller FIP route MTU
+      ansible.builtin.assert:
+        that:
+          - controller_external_network.networks | length == 1
+          - external_network_mtu | int >= 576
+          - controller_fip_route_mtu | int >= 576
+          - controller_fip_route_mtu | int <= 65535
+        fail_msg: >-
+          Could not determine a usable MTU for {{ network.external_network }}.
+          Set ssh.controller_fip_mtu explicitly or disable ssh.manage_controller_fip_route.
+      when: ssh.manage_controller_fip_route | default(true) | bool
+
+    - name: Constrain controller route to the current master FIP
+      ansible.builtin.command:
+        argv:
+          - "{{ root_dir }}/scripts/controller_fip_route.py"
+          - ensure
+          - --destination
+          - "{{ master_fip }}"
+          - --mtu
+          - "{{ controller_fip_route_mtu | string }}"
+          - --state-file
+          - "{{ controller_route_state_abs }}"
+      become: true
+      register: controller_fip_route_result
+      changed_when: true
+      when: ssh.manage_controller_fip_route | default(true) | bool
+
     - name: Create backend servers
       openstack.cloud.server:
         cloud: "{{ openstack.cloud }}"
@@ -373,6 +419,9 @@
           generator_network_isolated_from_backends: {{ (resolved_generator_network_mode == 'dedicated_external') | bool | to_json }}
           direct_backend_reachable: {{ (resolved_generator_network_mode != 'dedicated_external') | bool | to_json }}
           master_fip: {{ master_fip | to_json }}
+          external_network_mtu: {{ external_network_mtu | int | to_json }}
+          controller_fip_route_mtu: {{ controller_fip_route_mtu | int | to_json }}
+          controller_fip_route_managed: {{ (ssh.manage_controller_fip_route | default(true) | bool) | to_json }}
           master_private_ip: {{ master_generator_ip | to_json }}
           master_workload_ip: {{ master_workload_ip | to_json }}
           master_generator_ip: {{ master_generator_ip | to_json }}
@@ -428,3 +477,4 @@
         port: 22
         delay: 2
         timeout: 300
+

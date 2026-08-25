@@ -1,7 +1,58 @@
 ---
+- name: Reconcile controller route to benchmark master
+  hosts: localhost
+  gather_facts: false
+  vars:
+    root_dir: "{{ playbook_dir }}/.."
+  tasks:
+    - name: Ensure controller can reach current master FIP
+      ansible.builtin.include_tasks: tasks/ensure_controller_master_route.yml
+
+- name: Wait for jump host SSH readiness
+  hosts: master
+  gather_facts: false
+  tasks:
+    - name: Wait until jump host completes SSH handshakes reliably
+      ansible.builtin.wait_for_connection:
+        delay: 2
+        sleep: 5
+        connect_timeout: "{{ ssh.connect_timeout_seconds | default(10) | int }}"
+        timeout: "{{ ssh.readiness_timeout_seconds | default(600) | int }}"
+
+- name: Validate jump-host reachability to private SSH endpoints
+  hosts: master
+  gather_facts: false
+  vars:
+    private_ssh_targets: "{{ (groups.get('backends', []) + groups.get('locust_workers', [])) | unique }}"
+  tasks:
+    - name: Wait for TCP/22 from jump host to each private benchmark node
+      ansible.builtin.wait_for:
+        host: "{{ hostvars[item].ansible_host }}"
+        port: 22
+        connect_timeout: "{{ ssh.connect_timeout_seconds | default(10) | int }}"
+        timeout: "{{ ssh.private_tcp_timeout_seconds | default(180) | int }}"
+        sleep: 3
+        state: started
+      loop: "{{ private_ssh_targets }}"
+      loop_control:
+        label: "{{ item }} -> {{ hostvars[item].ansible_host }}:22"
+
+- name: Wait for private benchmark node SSH readiness
+  hosts: backends:locust_workers
+  gather_facts: false
+  serial: "{{ ssh.readiness_serial | default(2) | int }}"
+  tasks:
+    - name: Wait until private node is reachable through the jump host
+      ansible.builtin.wait_for_connection:
+        delay: 2
+        sleep: 5
+        connect_timeout: "{{ ssh.connect_timeout_seconds | default(10) | int }}"
+        timeout: "{{ ssh.readiness_timeout_seconds | default(600) | int }}"
+
 - name: Configure all benchmark nodes
   hosts: benchmark_nodes
   gather_facts: true
+  serial: "{{ ssh.configure_serial | default(4) | int }}"
   roles:
     - common
 
@@ -32,11 +83,14 @@
 - name: Configure native nginx backends
   hosts: backends
   gather_facts: true
+  serial: "{{ ssh.configure_serial | default(4) | int }}"
   roles:
     - backend
 
 - name: Configure Locust master and workers
   hosts: master:locust_workers
   gather_facts: true
+  serial: "{{ ssh.configure_serial | default(4) | int }}"
   roles:
     - locust
+

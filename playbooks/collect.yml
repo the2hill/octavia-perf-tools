@@ -6,6 +6,9 @@
     root_dir: "{{ playbook_dir }}/.."
     local_result_dir: "{{ root_dir }}/results/{{ benchmark_id }}"
   tasks:
+    - name: Ensure controller can reach current master FIP
+      ansible.builtin.include_tasks: tasks/ensure_controller_master_route.yml
+
     - name: Create local directories
       ansible.builtin.file:
         path: "{{ item }}"
@@ -235,3 +238,4 @@
         flat: true
       loop: "{{ range(0, capacity_processes_per_vm | int) | list }}"
       failed_when: false
+

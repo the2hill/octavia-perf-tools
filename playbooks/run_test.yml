@@ -5,6 +5,9 @@
   vars:
     root_dir: "{{ playbook_dir }}/.."
   tasks:
+    - name: Ensure controller can reach current master FIP
+      ansible.builtin.include_tasks: tasks/ensure_controller_master_route.yml
+
     - name: Read target state
       ansible.builtin.include_vars:
         file: "{{ root_dir }}/state/current_target.yml"
@@ -14,6 +17,28 @@
       ansible.builtin.add_host:
         name: runtime_target
         target_state: "{{ target_state }}"
+
+- name: Constrain FIP benchmark routes to the external-network MTU
+  hosts: master:locust_workers
+  gather_facts: false
+  vars:
+    target: "{{ hostvars['runtime_target'].target_state }}"
+    route_state_file: "/var/lib/octavia-perf/fip-route-{{ target.target_host }}.json"
+  tasks:
+    - name: Install narrow route for floating-IP target
+      ansible.builtin.command:
+        argv:
+          - /opt/octavia-perf/controller_fip_route.py
+          - ensure
+          - --destination
+          - "{{ target.target_host }}"
+          - --mtu
+          - "{{ target.external_network_mtu | default(1500) | string }}"
+          - --state-file
+          - "{{ route_state_file }}"
+      become: true
+      changed_when: true
+      when: (target.traffic_path | default('tenant_vip')) == 'floating_ip'
 
 - name: Verify target before benchmark
   hosts: master
@@ -245,3 +270,23 @@
       when:
         - inventory_hostname in groups['locust_workers']
         - (target.benchmark_engine | default('locust')) == 'connection_capacity'
+- name: Restore temporary FIP benchmark routes
+  hosts: master:locust_workers
+  gather_facts: false
+  vars:
+    target: "{{ hostvars['runtime_target'].target_state }}"
+    route_state_file: "/var/lib/octavia-perf/fip-route-{{ target.target_host }}.json"
+  tasks:
+    - name: Restore route after floating-IP benchmark
+      ansible.builtin.command:
+        argv:
+          - /opt/octavia-perf/controller_fip_route.py
+          - restore
+          - --state-file
+          - "{{ route_state_file }}"
+      become: true
+      changed_when: true
+      failed_when: false
+      when: (target.traffic_path | default('tenant_vip')) == 'floating_ip'
+
+
