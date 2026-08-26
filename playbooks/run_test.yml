@@ -152,8 +152,22 @@
       args:
         executable: /bin/bash
       become: true
+      register: locust_master_run
+      # Locust exits 1 when the completed test contains request failures/errors.
+      # Those are benchmark results and must still be collected/reported. Treat
+      # only other exit codes as orchestration failures.
+      failed_when: locust_master_run.rc not in [0, 1]
       changed_when: true
       when: (target.benchmark_engine | default('locust')) == 'locust'
+
+    - name: Report Locust completion status
+      ansible.builtin.debug:
+        msg: >-
+          Locust completed with rc={{ locust_master_run.rc }}.
+          {{ 'Request failures/errors were recorded; result collection will continue.' if locust_master_run.rc == 1 else 'No Locust failure exit code was reported.' }}
+      when:
+        - (target.benchmark_engine | default('locust')) == 'locust'
+        - locust_master_run is defined
 
 - name: Prepare synchronized connection-capacity start
   hosts: localhost

@@ -30,7 +30,11 @@ class OctaviaUser(FastHttpUser):
     def request_payload(self):
         headers = {"Connection": "close"} if CONNECTION_MODE == "close" else None
         with self.client.get(PATH, name=PATH, headers=headers, catch_response=True) as response:
-            if response.status_code != 200:
+            # FastHttpUser uses status_code == 0 when no valid HTTP response was
+            # received (for example TLS/socket/connection errors). In that case,
+            # leave the response untouched so Locust records the original exception
+            # instead of replacing it with CatchResponseError("unexpected HTTP 0").
+            if response.status_code and response.status_code != 200:
                 response.failure(f"unexpected HTTP {response.status_code}")
 
 
@@ -286,3 +290,4 @@ class BenchmarkShape(LoadTestShape):
         if self.profile == "max_rps":
             return self._max_rps_tick()
         return self._normal_tick()
+
