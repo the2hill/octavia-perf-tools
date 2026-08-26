@@ -24,7 +24,18 @@ make bootstrap
 make validate CONFIG=config/local.yml
 ```
 
-Validation checks local configuration, OpenStack connectivity/resources, and Barbican when an enabled TLS-termination scenario requires it.
+Validation checks local configuration, OpenStack connectivity/resources, and Barbican when an enabled TLS-termination scenario requires it. It also syntax-checks `playbooks/configure.yml`, which verifies that the repository-local roles can be resolved before provisioning begins.
+
+The expected role layout is:
+
+```text
+roles/
+  common/
+  backend/
+  locust/
+```
+
+`ansible.cfg` sets `roles_path = ./roles`. Run Ansible commands from the repository root (or explicitly set `ANSIBLE_CONFIG` to the repository's `ansible.cfg`).
 
 ## 3. Provision the reusable fleet
 
@@ -41,6 +52,94 @@ make benchmark CONFIG=config/local.yml
 ```
 
 The default matrix is intentionally request-rate/TLS focused. Connection-capacity and heavier bandwidth/CPS scenarios are opt-in because they substantially increase campaign time and resource pressure.
+
+
+## 5. Run a canonical clean baseline suite
+
+For a baseline that will later be compared with additional Octavia flavors or dedicated aggregates, use the repository runbook instead of issuing every scenario command manually:
+
+```bash
+chmod +x scripts/run_baseline_suite.sh
+./scripts/run_baseline_suite.sh
+```
+
+The default invocation is equivalent to:
+
+```text
+CONFIG=config/local.yml
+FLAVOR=amphora-default
+REPETITIONS=3
+REBUILD=1
+```
+
+Before changing cloud resources, the runbook validates that diagnostic changes have been restored to the canonical baseline:
+
+```yaml
+locust:
+  stages:
+    # ...
+    - { users: 8000, duration_seconds: 120, spawn_rate: 1000 }
+
+max_rps:
+  start_users: 500
+```
+
+This prevents temporary ramp-rate experiments such as `spawn_rate: 250`, `500`, or `750` from being mixed into the permanent baseline population.
+
+With `REBUILD=1`, the workflow is:
+
+```text
+make destroy
+remove generated state/*
+make provision
+make configure
+ansible connectivity check
+backend nginx HTTP check
+run baseline benchmark scenarios
+```
+
+Existing `results/` are preserved. Only generated state is reset. The full runbook output is written to:
+
+```text
+results/baseline-suite-<UTC timestamp>.log
+```
+
+The baseline scenarios are executed sequentially:
+
+```text
+http_1k_keepalive
+http_1k_max_rps
+http_1k_connection_churn
+tls_passthrough_1k_keepalive
+tls_passthrough_1k_connection_churn
+tls_passthrough_1k_max_rps
+tls_termination_1k_keepalive
+tls_termination_1k_connection_churn
+tls_termination_1k_max_rps
+```
+
+Override parameters through environment variables:
+
+```bash
+CONFIG=config/local.yml \
+FLAVOR=amphora-default \
+REPETITIONS=3 \
+./scripts/run_baseline_suite.sh
+```
+
+For a quick exploratory pass:
+
+```bash
+REPETITIONS=1 ./scripts/run_baseline_suite.sh
+```
+
+If the fleet is already known-good and you only want to run the benchmark portion:
+
+```bash
+REBUILD=0 ./scripts/run_baseline_suite.sh
+```
+
+For controlled flavor comparisons, keep the generator/backends, image, network topology, workload configuration, scenario definitions, thresholds, and benchmark code revision unchanged. Change only the Octavia flavor (and the intended Octavia aggregate/placement policy) so the resulting comparison remains attributable to the flavor under test.
 
 ## Find maximum sustainable RPS
 

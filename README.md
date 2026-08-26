@@ -181,6 +181,61 @@ make provision CONFIG=config/local.yml
 make benchmark CONFIG=config/local.yml
 ```
 
+`ansible.cfg` sets `roles_path = ./roles`, so the repository-level `roles/common`, `roles/backend`, and `roles/locust` roles are resolved even though the playbooks live under `playbooks/`. `make validate` also syntax-checks `playbooks/configure.yml` first so a missing or mispackaged role is caught before cloud resources are provisioned.
+
+
+## One-command clean baseline suite
+
+For a reproducible baseline of a single Octavia flavor, use the repository runbook:
+
+```bash
+chmod +x scripts/run_baseline_suite.sh
+./scripts/run_baseline_suite.sh
+```
+
+By default the runbook uses `config/local.yml`, flavor `amphora-default`, and three repetitions. It:
+
+1. preserves the existing `results/` directory;
+2. validates the canonical baseline settings (`8000` users at a final `spawn_rate` of `1000`, and `max_rps.start_users: 500`);
+3. runs `make destroy`;
+4. removes generated `state/*` while retaining `state/.gitkeep`;
+5. runs `make provision` and `make configure`;
+6. verifies Ansible connectivity and the nginx backend HTTP endpoint; and
+7. runs the HTTP, TLS-passthrough, and TLS-termination keepalive, connection-churn, and max-RPS baseline scenarios sequentially.
+
+The default scenario list is:
+
+```text
+http_1k_keepalive
+http_1k_max_rps
+http_1k_connection_churn
+tls_passthrough_1k_keepalive
+tls_passthrough_1k_connection_churn
+tls_passthrough_1k_max_rps
+tls_termination_1k_keepalive
+tls_termination_1k_connection_churn
+tls_termination_1k_max_rps
+```
+
+The runbook deliberately does **not** delete historical benchmark results. Full orchestration output is also written to `results/baseline-suite-<UTC timestamp>.log`.
+
+Override the flavor, configuration, or repetition count without editing the script:
+
+```bash
+CONFIG=config/local.yml \
+FLAVOR=amphora-default \
+REPETITIONS=3 \
+./scripts/run_baseline_suite.sh
+```
+
+If the reusable fleet is already freshly provisioned and configured, skip teardown/rebuild:
+
+```bash
+REBUILD=0 ./scripts/run_baseline_suite.sh
+```
+
+Keep the canonical workload settings and the benchmark Git revision unchanged when collecting a baseline that will later be compared with additional Octavia flavors or dedicated aggregates.
+
 Run selected scenarios/flavors without editing the file:
 
 ```bash
@@ -298,3 +353,28 @@ The current harness now covers the major HTTP/TLS request-rate, CPS-like, simult
 - active member failure/recovery while under load
 - externally located generators for a true Internet-edge/FIP campaign
 - statistical confidence intervals and regression thresholds suitable for CI gating
+
+## Troubleshooting Ansible role resolution
+
+If Ansible reports an error such as:
+
+```text
+the role 'common' was not found in .../playbooks/roles
+```
+
+run from the repository root and confirm the active configuration and role path:
+
+```bash
+.venv/bin/ansible-config dump --only-changed | grep -i roles
+ls -ld roles/common roles/backend roles/locust
+.venv/bin/ansible-playbook playbooks/configure.yml --syntax-check -e @config/local.yml
+```
+
+The repository `ansible.cfg` must contain:
+
+```ini
+[defaults]
+roles_path = ./roles
+```
+
+If you invoke Ansible from another working directory, either `cd` to the repository root first or set `ANSIBLE_CONFIG=/path/to/octavia-perf-tool/ansible.cfg`.
