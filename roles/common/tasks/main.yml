@@ -42,3 +42,12 @@
     group: root
     mode: "0755"
   become: true
+
+- name: Install FIP route helper
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../scripts/controller_fip_route.py"
+    dest: /opt/octavia-perf/controller_fip_route.py
+    owner: root
+    group: root
+    mode: "0755"
+  become: true
