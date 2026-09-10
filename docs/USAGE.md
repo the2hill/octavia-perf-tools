@@ -45,6 +45,20 @@ make provision CONFIG=config/local.yml
 
 The same generator/backend fleet is reused across Octavia flavor/scenario runs. Reusing it is important for fair comparisons.
 
+### Controller-to-FIP MTU protection
+
+By default provisioning queries the external network MTU and installs a temporary host route for the current master FIP on the machine running Ansible. This is specifically for environments where the controller itself is on a jumbo tenant network but the external network is smaller (for example tenant MTU 3942 and PUBLICNET MTU 1500). The controller needs passwordless `sudo`/Ansible `become` for this route operation.
+
+```yaml
+ssh:
+  manage_controller_fip_route: true
+  controller_fip_mtu: auto
+```
+
+`auto` uses the MTU returned by Neutron for `network.external_network`. Set an integer only when the cloud metadata is incorrect. If your controller networking is managed externally, set `manage_controller_fip_route: false`. `make destroy` restores any prior exact `/32` route recorded by the harness.
+
+Provisioning also validates the private management path before fact gathering: the master waits for TCP/22 to each backend and Locust worker, then the generated inventory uses an explicit key-bearing SSH `ProxyCommand`. If this phase fails, test from the master directly with `nc -vz <private-ip> 22`; a TCP failure is a Neutron/security-group/guest-readiness issue, while a successful TCP test followed by an Ansible failure points to SSH/proxy configuration.
+
 ## 4. Run the configured default matrix
 
 ```bash
@@ -53,93 +67,60 @@ make benchmark CONFIG=config/local.yml
 
 The default matrix is intentionally request-rate/TLS focused. Connection-capacity and heavier bandwidth/CPS scenarios are opt-in because they substantially increase campaign time and resource pressure.
 
+### Canonical baseline runbook
 
-## 5. Run a canonical clean baseline suite
-
-For a baseline that will later be compared with additional Octavia flavors or dedicated aggregates, use the repository runbook instead of issuing every scenario command manually:
+For the standard single-flavor campaign use:
 
 ```bash
-chmod +x scripts/run_baseline_suite.sh
 ./scripts/run_baseline_suite.sh
 ```
 
-The default invocation is equivalent to:
+Its lifecycle is intentionally different from a basic standalone `benchmark.py` invocation:
 
 ```text
-CONFIG=config/local.yml
-FLAVOR=amphora-default
-REPETITIONS=3
-REBUILD=1
+1. validate canonical workload settings
+2. optionally rebuild the reusable generator/backend fleet
+3. collect selected direct-to-nginx controls once
+4. create one persistent Octavia LB/amphora for FLAVOR
+5. for each scenario/repetition:
+     create scenario listener/pool/members/health monitor
+     run the workload
+     remove scenario child resources and ephemeral Barbican secrets
+     keep the LB/amphora
+6. delete the persistent LB after the Octavia phase
+7. regenerate comparison artifacts
 ```
 
-Before changing cloud resources, the runbook validates that diagnostic changes have been restored to the canonical baseline:
+This is preferred for controlled flavor characterization because the Amphora placement and VM remain constant across the suite. Scenario protocol changes do not require a new Amphora: HTTP, TLS passthrough, TLS termination, and re-encryption replace the listener/pool configuration on the same LB.
 
-```yaml
-locust:
-  stages:
-    # ...
-    - { users: 8000, duration_seconds: 120, spawn_rate: 1000 }
+The direct controls are also collected once per suite, not before every Octavia scenario. They exist to establish generator/backend headroom; the underlying generator/backend fleet is unchanged during the suite.
 
-max_rps:
-  start_users: 500
-```
-
-This prevents temporary ramp-rate experiments such as `spawn_rate: 250`, `500`, or `750` from being mixed into the permanent baseline population.
-
-With `REBUILD=1`, the workflow is:
-
-```text
-make destroy
-remove generated state/*
-make provision
-make configure
-ansible connectivity check
-backend nginx HTTP check
-run baseline benchmark scenarios
-```
-
-Existing `results/` are preserved. Only generated state is reset. The full runbook output is written to:
-
-```text
-results/baseline-suite-<UTC timestamp>.log
-```
-
-The baseline scenarios are executed sequentially:
-
-```text
-http_1k_keepalive
-http_1k_max_rps
-http_1k_connection_churn
-tls_passthrough_1k_keepalive
-tls_passthrough_1k_connection_churn
-tls_passthrough_1k_max_rps
-tls_termination_1k_keepalive
-tls_termination_1k_connection_churn
-tls_termination_1k_max_rps
-```
-
-Override parameters through environment variables:
+Useful runbook overrides:
 
 ```bash
 CONFIG=config/local.yml \
 FLAVOR=amphora-default \
 REPETITIONS=3 \
+LB_CREATE_ATTEMPTS=3 \
+LB_CREATE_RETRY_DELAY_SECONDS=30 \
 ./scripts/run_baseline_suite.sh
 ```
 
-For a quick exploratory pass:
-
-```bash
-REPETITIONS=1 ./scripts/run_baseline_suite.sh
-```
-
-If the fleet is already known-good and you only want to run the benchmark portion:
+Reuse an already provisioned generator/backend fleet:
 
 ```bash
 REBUILD=0 ./scripts/run_baseline_suite.sh
 ```
 
-For controlled flavor comparisons, keep the generator/backends, image, network topology, workload configuration, scenario definitions, thresholds, and benchmark code revision unchanged. Change only the Octavia flavor (and the intended Octavia aggregate/placement policy) so the resulting comparison remains attributable to the flavor under test.
+For experimental flavors that should be disabled immediately after their first LB is created:
+
+```bash
+PAUSE_AFTER_LB_CREATE=1 \
+FLAVOR=my-experimental-flavor \
+./scripts/run_baseline_suite.sh
+```
+
+The runbook pauses only after the persistent LB/amphora is successfully provisioned and prints that the flavor can be disabled. Disable the flavor, then press Enter; subsequent scenarios reuse the existing LB and do not create another Amphora.
 
 ## Find maximum sustainable RPS
 
@@ -258,12 +239,15 @@ The example configuration deliberately keeps listener policy above the test:
 ```yaml
 octavia:
   listener:
-    connection_limit: 1000000
+    # Used by normal RPS/CPS/bandwidth scenarios.
+    connection_limit: 100000
+    # Used only by connection_capacity scenarios.
+    capacity_connection_limit: 1000000
     timeout_client_data_ms: 300000
     timeout_member_data_ms: 300000
 ```
 
-Do not set `connection_limit` below the largest connection-capacity level. Keep `timeout_client_data_ms` above the idle hold duration or the idle test will measure the listener timeout rather than a capacity ceiling. `make validate` checks both conditions.
+Keep `connection_limit` above the largest concurrency used by normal Locust/max-RPS scenarios. Do not set `capacity_connection_limit` below the largest connection-capacity level. Keep `timeout_client_data_ms` above the idle hold duration or the idle test will measure the listener timeout rather than a capacity ceiling. `make validate` checks these conditions.
 
 ## Tune connection-capacity levels
 
@@ -354,11 +338,13 @@ This adds a routed generator subnet while preserving the tenant VIP as the targe
 
 ## Example: broad flavor characterization campaign
 
-For each flavor, run:
+For each flavor, prefer persistent-LB mode so all scenarios/repetitions use the same Amphora:
 
 ```bash
 .venv/bin/python scripts/benchmark.py \
   --config config/local.yml \
+  --flavor my-octavia-flavor \
+  --reuse-load-balancer \
   --scenario http_1k_keepalive \
   --scenario tls_termination_1k_keepalive \
   --scenario http_1k_connection_churn \
@@ -367,6 +353,8 @@ For each flavor, run:
   --scenario tls_termination_connection_capacity_active \
   --scenario http_1m_keepalive
 ```
+
+Without `--reuse-load-balancer`, standalone `benchmark.py` retains the original per-run LB create/destroy lifecycle.
 
 Then repeat the same scenario list with `benchmark.traffic_path: floating_ip` if external/FIP behavior is part of the product characterization.
 
@@ -441,4 +429,194 @@ Always compare within the same scenario, traffic path, and generator topology. T
 make destroy CONFIG=config/local.yml
 ```
 
-The harness removes scenario LBs and transient Barbican secrets, compute resources, and harness-created networks/routers.
+A successful persistent-LB campaign removes its campaign LB automatically after the Octavia phase. `make destroy` is still the full cleanup path for interrupted campaigns or when tearing down the reusable fleet; it removes outstanding benchmark LBs/secrets, compute resources, and harness-created networks/routers.
+
+## Persistent-LB lifecycle, resilience, and failed provisioning
+
+The canonical baseline runbook uses `benchmark.py --reuse-load-balancer`. The selected Octavia flavor is used once to create a persistent campaign LB/amphora; later scenarios reuse that same LB and only create/delete their child resources.
+
+Defaults for the initial persistent LB create are:
+
+```text
+LB_CREATE_ATTEMPTS=3
+LB_CREATE_RETRY_DELAY_SECONDS=30
+```
+
+Override them without editing the repository:
+
+```bash
+LB_CREATE_ATTEMPTS=4 \
+LB_CREATE_RETRY_DELAY_SECONDS=45 \
+./scripts/run_baseline_suite.sh
+```
+
+If initial persistent LB provisioning fails, the harness performs this sequence before retrying:
+
+```text
+create_campaign_lb.yml fails
+    |
+    +-- preserve exact Ansible output
+    |
+    +-- query the failed LB before deletion
+    |     - load-balancer object and provisioning/operating status
+    |     - Octavia status tree
+    |     - amphora IDs/status/image/flavor/management IP where permitted
+    |     - Nova server state/fault and console tail for amphora compute IDs
+    |     - relevant Neutron VIP/HA/VRRP ports
+    |
+    +-- destroy the failed LB
+    |
+    +-- verify the deterministic LB name is absent
+    |
+    +-- delay, then recreate it
+```
+
+A successful retry becomes the one persistent LB used for the rest of the campaign. Initial failed provisioning attempts are diagnostic artifacts, not benchmark samples.
+
+Once the persistent LB exists, a scenario failure does **not** cause the Amphora to be rebuilt. The per-run cleanup calls `destroy_campaign_lb_scenario.yml`, which removes the scenario health monitor, members, pool, listener, temporary FIP route state, and ephemeral Barbican secrets while leaving the persistent LB/amphora intact. With `--continue-on-error`, later scenarios/repetitions can continue on that same Amphora.
+
+The persistent campaign LB itself is deleted in final cleanup after all selected Octavia runs. This also happens when a later scenario raises an exception because the campaign lifecycle uses a `finally` cleanup.
+
+### Experimental flavor pause
+
+Use:
+
+```bash
+PAUSE_AFTER_LB_CREATE=1 \
+FLAVOR=my-experimental-flavor \
+./scripts/run_baseline_suite.sh
+```
+
+The pause occurs after the persistent LB/amphora has been created but before any Octavia scenario traffic starts. The flavor may then be disabled; continuing the suite does not need to create another LB/amphora.
+
+For manual campaigns the equivalent flags are:
+
+```bash
+.venv/bin/python scripts/benchmark.py \
+  --config config/local.yml \
+  --flavor my-experimental-flavor \
+  --reuse-load-balancer \
+  --pause-after-lb-create \
+  --continue-on-error \
+  --lb-create-attempts 3 \
+  --lb-create-retry-delay-seconds 30 \
+  --scenario http_1k_keepalive \
+  --scenario tls_termination_1k_keepalive
+```
+
+`--pause-after-lb-create` requires an interactive terminal and requires `--reuse-load-balancer`.
+
+### Direct controls once per suite
+
+The baseline runbook first invokes `benchmark.py --direct-baselines-only` with all selected direct-control scenarios, then invokes the Octavia phase with `--skip-baseline`. This prevents the same nginx-direct control from being repeated simply because each Octavia scenario is a separate workload shape.
+
+A manual standalone `benchmark.py` invocation remains backward-compatible: unless `--reuse-load-balancer` is supplied, it creates/destroys an LB per Octavia run; unless `--skip-baseline` or `--direct-baselines-only` is supplied, it performs its normal direct-baseline behavior.
+
+Per-attempt provisioning diagnostics are stored under the persistent campaign-LB result directory, for example:
+
+```text
+results/<campaign-id>-<flavor>-campaign-lb/orchestration/lb-create-attempt-01.log
+results/<campaign-id>-<flavor>-campaign-lb/orchestration/lb-create-attempt-01-diagnostics.json
+results/<campaign-id>-<flavor>-campaign-lb/orchestration/lb-create-attempt-01-cleanup.log
+results/<campaign-id>-<flavor>-campaign-lb/orchestration/lb-create-attempt-01-post-cleanup.json
+```
+
+Run/scenario failures are summarized under:
+
+```text
+results/campaign-failures-<UTC timestamp>.yml
+```
+
+The Octavia API can show that provisioning entered `ERROR`, the status tree, and amphora state, but it does not always expose the controller-worker exception that caused the failure. When the diagnostic JSON does not identify the root cause, use the captured load-balancer ID, amphora IDs, compute IDs, and timestamps to search Octavia worker/health-manager logs.
+
+## Combined cross-flavor campaign report
+
+When baseline suites are run **one Octavia flavor at a time**, leave their completed run directories under the same `results/` tree. After all flavors have been tested, build one combined comparison package with:
+
+```bash
+make campaign-report
+```
+
+or directly:
+
+```bash
+.venv/bin/python scripts/compare_campaigns.py results
+```
+
+The report scans completed `results/*/summary.json` files. By default it uses the **latest three successful runs per flavor + scenario + traffic path + generator topology**, matching the canonical three-repetition baseline while avoiding accidental mixing with older historical runs.
+
+For an explicit four-flavor comparison:
+
+```bash
+.venv/bin/python scripts/compare_campaigns.py results \
+  --flavor flavor-a \
+  --flavor flavor-b \
+  --flavor flavor-c \
+  --flavor flavor-d \
+  --reference-flavor flavor-a
+```
+
+Use every matching historical run instead of the latest three with:
+
+```bash
+.venv/bin/python scripts/compare_campaigns.py results --latest-per-group 0
+```
+
+The generated package is written to `results/campaign-comparison/` and contains:
+
+```text
+README.md                       # simple executive scorecard + overview charts
+DETAILED_COMPARISON.md          # actual values and per-scenario compare/contrast tables
+selected-runs.csv               # exact source result directories used
+scenario-summary.csv            # median/min/max/std/CV/p99/failures/deltas
+flavor-scorecard.csv            # compact cross-scenario flavor ranking
+scenario-winners.csv            # winner/margin for each comparable scenario population
+direct-reference-summary.csv    # recent nginx-direct controls when available
+charts/
+  composite-dashboard.png              # all-in-one presentation/share view
+  flavor-overall-performance-index.png
+  scenario-performance-index.png
+  scenario-latency-index.png
+  scenario-wins.png
+  flavor-variability.png
+  actual-<scenario>-*.png
+  p99-<scenario>-*.png
+```
+
+For a quick compare/contrast, open `charts/composite-dashboard.png` first. It combines six views in one image: overall cross-scenario performance index, scenario wins, normalized performance by scenario, normalized p99 latency by scenario, run-to-run coefficient of variation, and median Octavia throughput as a percentage of the matching flavor-scoped direct-nginx control. If a flavor has no scoped direct control, the direct-efficiency panel leaves it out rather than borrowing an unrelated or legacy baseline.
+
+The primary metric is selected from each scenario's semantics rather than pretending every test is the same kind of RPS measurement:
+
+- ordinary 1 KiB keepalive: peak request rate;
+- adaptive `*_max_rps`: max sustainable RPS;
+- `*_connection_churn`: approximate new connections/s;
+- connection-capacity engine: max sustainable simultaneous connections;
+- large-payload bandwidth scenarios: estimated application payload Gb/s.
+
+The overview `performance index` normalizes each scenario so its best flavor is 100, then summarizes those indexes across scenarios. This gives a simple high-level comparison without mixing incompatible units. Use `DETAILED_COMPARISON.md` for the actual values behind the index.
+
+Direct nginx runs are retained only as reference measurements and are not ranked as Octavia flavors. The report also checks comparison fingerprints **across flavors** inside each scenario/path/topology population. Use `--strict-fingerprint` to make any detected configuration drift fail the report command.
+
+## Flavor selection and suite provenance
+
+`scripts/run_baseline_suite.sh` is intentionally a **one-Octavia-flavor-at-a-time** runbook. Select the flavor explicitly:
+
+```bash
+FLAVOR=my-octavia-flavor REPETITIONS=3 ./scripts/run_baseline_suite.sh
+```
+
+If `FLAVOR` is omitted, the runbook reads `octavia.flavors` from the selected config. Exactly one configured flavor is accepted in that mode. If the config contains multiple flavors, the runbook exits and requires `FLAVOR=<name>` rather than silently choosing one.
+
+Every runbook invocation creates a unique `suite_id`. The same suite ID is passed to the direct-control phase and the Octavia phase. Direct nginx results remain `target_kind: direct`, but now also record:
+
+```yaml
+suite_id: <suite-id>
+baseline_for_flavor: <requested-octavia-flavor>
+```
+
+`baseline_for_flavor` is **provenance**, not a claim that the direct path uses that Octavia flavor. It identifies which one-flavor baseline suite collected the control result.
+
+Before persistent-LB creation, `benchmark.py` resolves the requested Octavia flavor to its UUID with openstacksdk. The create playbook passes that UUID to Octavia and asserts that the resulting load balancer reports the same immutable `flavor_id`. A mismatch aborts the suite rather than benchmarking the wrong Amphora. The selected flavor must be enabled for this initial create; it may be disabled after the optional `PAUSE_AFTER_LB_CREATE=1` pause.
+
+For combined reports, new direct controls are associated with their matching `baseline_for_flavor`. Direct controls created before this provenance change appear as `legacy_unscoped`; they are retained for context but are not silently assigned to a flavor-specific Octavia-to-direct ratio.
+

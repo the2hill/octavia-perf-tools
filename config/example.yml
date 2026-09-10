@@ -55,6 +55,21 @@ ssh:
   private_key_file: state/octavia-perf-ed25519
   public_key_file: state/octavia-perf-ed25519.pub
   keypair_name: octavia-perf-key
+  # SSH readiness/fan-out controls. Private nodes are reached through the master.
+  # Small readiness/configure batches prevent a freshly booted jump host from being
+  # flooded with simultaneous ProxyJump handshakes.
+  connect_timeout_seconds: 10
+  readiness_timeout_seconds: 600
+  private_tcp_timeout_seconds: 180
+  readiness_serial: 2
+  configure_serial: 4
+  retries: 5
+  # The Ansible controller may itself live on a jumbo tenant network while the
+  # OpenStack external/FIP network is 1500. Automatically install a temporary
+  # /32 route for the current master FIP using the external network MTU, then
+  # restore the previous route during destroy. Requires sudo on the controller.
+  manage_controller_fip_route: true
+  controller_fip_mtu: auto
   # Set this to the public CIDR from which you will run Ansible, normally /32.
   operator_cidr: 203.0.113.10/32
 
@@ -580,6 +595,12 @@ campaign:
   baseline_repetitions: 1
   randomize_run_order: true
   cooldown_seconds: 15
+  # Ordinary benchmark.py invocations remain fail-fast unless --continue-on-error
+  # is supplied. The baseline runbook enables continue-on-error and defaults to
+  # three LB provisioning attempts so a transient Octavia build failure does not
+  # terminate an otherwise useful campaign.
+  lb_create_attempts: 3
+  lb_create_retry_delay_seconds: 30
 
 metrics:
   sample_interval_seconds: 1
@@ -591,10 +612,12 @@ octavia:
   flavors:
     - default
   lb_algorithm: ROUND_ROBIN
-  # Keep benchmark policy limits above the workload so a configured listener cap
-  # or idle timeout is not mistaken for the Octavia flavor's resource ceiling.
+  # Keep request-rate/CPS listener policy comfortably above the normal workload
+  # without using an unnecessarily huge maxconn for every test. Connection-capacity
+  # scenarios use capacity_connection_limit instead.
   listener:
-    connection_limit: 1000000
+    connection_limit: 100000
+    capacity_connection_limit: 1000000
     timeout_client_data_ms: 300000
     timeout_member_data_ms: 300000
   health_monitor:
@@ -602,3 +625,4 @@ octavia:
     timeout: 3
     max_retries: 3
     max_retries_down: 3
+

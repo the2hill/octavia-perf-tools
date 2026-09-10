@@ -1,0 +1,165 @@
+---
+- name: Load current scenario target for cleanup
+  hosts: localhost
+  gather_facts: false
+  vars:
+    root_dir: "{{ playbook_dir }}/.."
+  tasks:
+    - name: Check current target state
+      ansible.builtin.stat:
+        path: "{{ root_dir }}/state/current_target.yml"
+      register: current_target_file
+
+    - name: Read current target state
+      ansible.builtin.include_vars:
+        file: "{{ root_dir }}/state/current_target.yml"
+        name: cleanup_target_state
+      when: current_target_file.stat.exists
+
+    - name: Publish cleanup target state
+      ansible.builtin.add_host:
+        name: runtime_cleanup_target
+        target_state: "{{ cleanup_target_state | default({}) }}"
+
+- name: Restore temporary generator FIP routes after a failed/interrupted scenario
+  hosts: master:locust_workers
+  gather_facts: false
+  vars:
+    target: "{{ hostvars['runtime_cleanup_target'].target_state }}"
+    route_state_file: "/var/lib/octavia-perf/fip-route-{{ target.target_host | default('none') }}.json"
+  tasks:
+    - name: Restore pre-benchmark route
+      ansible.builtin.command:
+        argv:
+          - /opt/octavia-perf/controller_fip_route.py
+          - restore
+          - --state-file
+          - "{{ route_state_file }}"
+      become: true
+      changed_when: true
+      failed_when: false
+      when:
+        - (target.traffic_path | default('tenant_vip')) == 'floating_ip'
+        - target.target_host | default('') | length > 0
+
+- name: Delete scenario listener and ephemeral Barbican secrets but keep persistent load balancer
+  hosts: localhost
+  gather_facts: false
+  vars:
+    root_dir: "{{ playbook_dir }}/.."
+    scenario_slug: "{{ scenario_name | regex_replace('[^A-Za-z0-9_.-]', '-') }}"
+    flavor_slug: "{{ (octavia_flavor | default('default')) | regex_replace('[^A-Za-z0-9_.-]', '-') }}"
+    state_file: "{{ root_dir }}/state/campaign_lb-{{ flavor_slug }}-{{ campaign_id }}.yml"
+  tasks:
+    - name: Load persistent campaign load balancer state
+      ansible.builtin.include_vars:
+        file: "{{ state_file }}"
+        name: campaign_lb
+
+    - name: Set scenario child resource names
+      ansible.builtin.set_fact:
+        listener_name: "{{ campaign_lb.load_balancer_name }}-{{ scenario_slug }}-listener"
+        pool_name: "{{ campaign_lb.load_balancer_name }}-{{ scenario_slug }}-pool"
+        hm_name: "{{ campaign_lb.load_balancer_name }}-{{ scenario_slug }}-hm"
+
+    - name: Delete scenario health monitor
+      openstack.cloud.lb_health_monitor:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ hm_name }}"
+        pool: "{{ pool_name }}"
+        state: absent
+        wait: true
+        timeout: 600
+      failed_when: false
+
+    - name: Delete scenario backend members
+      openstack.cloud.lb_member:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ item }}"
+        pool: "{{ pool_name }}"
+        state: absent
+        wait: true
+        timeout: 600
+      loop: "{{ groups['backends'] }}"
+      failed_when: false
+
+    - name: Delete scenario pool
+      openstack.cloud.lb_pool:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ pool_name }}"
+        listener: "{{ listener_name }}"
+        state: absent
+        wait: true
+        timeout: 600
+      failed_when: false
+
+    - name: Delete scenario listener
+      openstack.cloud.lb_listener:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ listener_name }}"
+        load_balancer: "{{ campaign_lb.load_balancer_name }}"
+        state: absent
+        wait: true
+        timeout: 600
+      failed_when: false
+
+    - name: Retry scenario pool deletion after listener removal
+      openstack.cloud.lb_pool:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ pool_name }}"
+        listener: "{{ listener_name }}"
+        state: absent
+        wait: true
+        timeout: 600
+      failed_when: false
+
+    - name: Retry scenario listener deletion after pool removal
+      openstack.cloud.lb_listener:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ listener_name }}"
+        load_balancer: "{{ campaign_lb.load_balancer_name }}"
+        state: absent
+        wait: true
+        timeout: 600
+      failed_when: false
+
+    - name: Check per-run secret tracking file
+      ansible.builtin.stat:
+        path: "{{ root_dir }}/state/current_secrets.yml"
+      register: secret_state_file
+
+    - name: Load per-run secret references
+      ansible.builtin.include_vars:
+        file: "{{ root_dir }}/state/current_secrets.yml"
+        name: secret_state
+      when: secret_state_file.stat.exists
+
+    - name: Delete ephemeral Barbican secrets after listener releases them
+      ansible.builtin.command:
+        argv:
+          - "{{ root_dir }}/.venv/bin/python"
+          - "{{ root_dir }}/scripts/barbican_secret.py"
+          - delete
+          - --cloud
+          - "{{ openstack.cloud }}"
+          - --region
+          - "{{ openstack.region_name | default('') }}"
+          - --ref
+          - "{{ item }}"
+      loop: "{{ secret_state.secret_refs | default([]) if secret_state_file.stat.exists else [] }}"
+      changed_when: true
+      failed_when: false
+
+    - name: Reset per-run secret tracking
+      ansible.builtin.copy:
+        dest: "{{ root_dir }}/state/current_secrets.yml"
+        mode: "0600"
+        content: |
+          secret_refs: []
+

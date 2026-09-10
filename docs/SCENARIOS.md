@@ -245,6 +245,12 @@ generator_network:
 
 The first resolves to shared tenant-network generators; the second resolves to a dedicated externally routed generator network. Keep these as separate comparison populations.
 
+## Persistent-LB scenario lifecycle
+
+The canonical baseline suite keeps one LB/amphora for the selected Octavia flavor across all scenarios and repetitions. Scenario transitions do not reuse incompatible listener state: before each Octavia run the harness creates the listener, pool, members, health monitor, TLS secrets, and tuning required by that scenario, then removes those child resources after the run. The LB/VIP and Amphora VM remain in place until the Octavia phase ends.
+
+This means HTTP, TCP/TLS passthrough, terminated HTTPS, re-encryption, normal request-rate tests, and connection-capacity tests can share the same Amphora while still receiving their own protocol-specific listener/pool configuration and listener connection limit.
+
 ## Listener connection limit and inactivity timeouts
 
 Connection-capacity tests must not be constrained by listener policy before the flavor itself is stressed. The example configuration therefore sets:
@@ -262,3 +268,4 @@ The harness applies these settings to every benchmark listener and records the v
 `connection_limit` must be at least the highest configured capacity level. The client inactivity timeout must be longer than the idle hold interval. The validator rejects configurations that would make those policy settings the obvious measured ceiling.
 
 These values are benchmark controls, not recommended production defaults. If a provider rejects them, reduce them only with a corresponding reduction in the test levels/hold duration and document that constraint in the campaign metadata.
+

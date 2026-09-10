@@ -1,0 +1,65 @@
+---
+- name: Create persistent Octavia load balancer for benchmark campaign
+  hosts: localhost
+  gather_facts: false
+  vars:
+    root_dir: "{{ playbook_dir }}/.."
+    use_fip: "{{ (benchmark.traffic_path | default('tenant_vip')) == 'floating_ip' }}"
+    flavor_slug: "{{ (octavia_flavor | default('default')) | regex_replace('[^A-Za-z0-9_.-]', '-') }}"
+    requested_flavor_id: "{{ octavia_flavor_id | default('', true) }}"
+    lb_name: "{{ run_prefix }}-{{ flavor_slug }}-campaign-{{ campaign_id }}"
+    state_file: "{{ root_dir }}/state/campaign_lb-{{ flavor_slug }}-{{ campaign_id }}.yml"
+  tasks:
+    - name: Create persistent campaign load balancer
+      openstack.cloud.loadbalancer:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ lb_name }}"
+        vip_subnet: "{{ network.subnet_name }}"
+        flavor: "{{ requested_flavor_id if requested_flavor_id | length > 0 else omit }}"
+        assign_floating_ip: "{{ use_fip | bool }}"
+        floating_ip_network: "{{ network.external_network if use_fip | bool else omit }}"
+        wait: true
+        timeout: 900
+        state: present
+      register: lb
+
+    - name: Verify persistent LB was created with requested Octavia flavor
+      ansible.builtin.assert:
+        that:
+          - (lb.load_balancer.flavor_id | default('') | string) == (requested_flavor_id | string)
+        fail_msg: >-
+          Requested Octavia flavor {{ octavia_flavor }} ({{ requested_flavor_id }}) but
+          load balancer {{ lb_name }} reports flavor_id={{ lb.load_balancer.flavor_id | default('<none>') }}.
+          Refusing to benchmark the wrong Amphora flavor.
+      when: requested_flavor_id | length > 0
+
+    - name: Load provisioned infrastructure MTU facts
+      ansible.builtin.include_vars:
+        file: "{{ root_dir }}/state/infrastructure.yml"
+        name: infrastructure_state
+
+    - name: Choose persistent benchmark target address
+      ansible.builtin.set_fact:
+        target_host: "{{ lb.floating_ip.floating_ip_address if use_fip | bool else lb.load_balancer.vip_address }}"
+
+    - name: Persist campaign load balancer state
+      ansible.builtin.copy:
+        dest: "{{ state_file }}"
+        mode: "0600"
+        content: |
+          campaign_id: {{ campaign_id | to_json }}
+          octavia_flavor: {{ octavia_flavor | to_json }}
+          requested_flavor_id: {{ (requested_flavor_id if requested_flavor_id | length > 0 else None) | to_json }}
+          traffic_path: {{ benchmark.traffic_path | default('tenant_vip') | to_json }}
+          external_network_mtu: {{ infrastructure_state.external_network_mtu | default(1500) | int | to_json }}
+          load_balancer_name: {{ lb_name | to_json }}
+          load_balancer_id: {{ lb.load_balancer.id | to_json }}
+          provider: {{ lb.load_balancer.provider | default(None) | to_json }}
+          flavor_id: {{ lb.load_balancer.flavor_id | default(None) | to_json }}
+          vip_address: {{ lb.load_balancer.vip_address | to_json }}
+          vip_network_id: {{ lb.load_balancer.vip_network_id | default(None) | to_json }}
+          vip_subnet_id: {{ lb.load_balancer.vip_subnet_id | default(None) | to_json }}
+          target_host: {{ target_host | to_json }}
+          floating_ip_address: {{ (lb.floating_ip.floating_ip_address if use_fip | bool else None) | to_json }}
+

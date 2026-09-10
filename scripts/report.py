@@ -85,6 +85,8 @@ def base_summary(target: dict, manifest: dict) -> dict:
     workload_spec = manifest.get("workload") or {}
     return {
         "benchmark_id": target.get("benchmark_id"),
+        "suite_id": target.get("suite_id") or target.get("campaign_id"),
+        "baseline_for_flavor": target.get("baseline_for_flavor"),
         "target_kind": target.get("target_kind"),
         "benchmark_engine": scenario.get("benchmark_engine") or target.get("benchmark_engine") or "locust",
         "locust_profile": scenario.get("locust_profile") or target.get("locust_profile") or "staircase",
@@ -580,3 +582,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

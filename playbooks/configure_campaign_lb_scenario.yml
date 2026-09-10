@@ -1,0 +1,264 @@
+---
+- name: Configure scenario resources on persistent Octavia campaign load balancer
+  hosts: localhost
+  gather_facts: false
+  vars:
+    root_dir: "{{ playbook_dir }}/.."
+    scenario: "{{ scenarios.catalog[scenario_name] }}"
+    flavor_slug: "{{ (octavia_flavor | default('default')) | regex_replace('[^A-Za-z0-9_.-]', '-') }}"
+    state_file: "{{ root_dir }}/state/campaign_lb-{{ flavor_slug }}-{{ campaign_id }}.yml"
+    scenario_slug: "{{ scenario_name | regex_replace('[^A-Za-z0-9_.-]', '-') }}"
+    listener_connection_limit_effective: >-
+      {{
+        octavia.listener.capacity_connection_limit | default(1000000)
+        if (scenario.benchmark_engine | default('locust')) == 'connection_capacity'
+        else octavia.listener.connection_limit | default(100000)
+      }}
+  tasks:
+    - name: Load persistent campaign load balancer state
+      ansible.builtin.include_vars:
+        file: "{{ state_file }}"
+        name: campaign_lb
+
+    - name: Set persistent load balancer child resource names
+      ansible.builtin.set_fact:
+        lb_name: "{{ campaign_lb.load_balancer_name }}"
+        listener_name: "{{ campaign_lb.load_balancer_name }}-{{ scenario_slug }}-listener"
+        pool_name: "{{ campaign_lb.load_balancer_name }}-{{ scenario_slug }}-pool"
+        hm_name: "{{ campaign_lb.load_balancer_name }}-{{ scenario_slug }}-hm"
+
+    - name: Initialize per-run secret tracking
+      ansible.builtin.copy:
+        dest: "{{ root_dir }}/state/current_secrets.yml"
+        mode: "0600"
+        content: |
+          secret_refs: []
+
+    - name: Upload frontend PKCS12 bundle to Barbican
+      ansible.builtin.command:
+        argv:
+          - "{{ root_dir }}/.venv/bin/python"
+          - "{{ root_dir }}/scripts/barbican_secret.py"
+          - create
+          - --cloud
+          - "{{ openstack.cloud }}"
+          - --region
+          - "{{ openstack.region_name | default('') }}"
+          - --name
+          - "{{ lb_name }}-{{ scenario_slug }}-frontend-pkcs12"
+          - --file
+          - "{{ root_dir }}/state/tls/frontend.p12"
+          - --content-type
+          - application/octet-stream
+      register: frontend_secret_cmd
+      when: scenario.frontend_tls_termination | default(false) | bool
+      changed_when: true
+
+    - name: Parse frontend Barbican secret
+      ansible.builtin.set_fact:
+        frontend_secret: "{{ frontend_secret_cmd.stdout | from_json }}"
+      when: scenario.frontend_tls_termination | default(false) | bool
+
+    - name: Persist frontend secret immediately for failure-safe cleanup
+      ansible.builtin.copy:
+        dest: "{{ root_dir }}/state/current_secrets.yml"
+        mode: "0600"
+        content: |
+          secret_refs:
+            - {{ frontend_secret.secret_ref | to_json }}
+      when: scenario.frontend_tls_termination | default(false) | bool
+
+    - name: Upload backend CA certificate to Barbican for re-encryption
+      ansible.builtin.command:
+        argv:
+          - "{{ root_dir }}/.venv/bin/python"
+          - "{{ root_dir }}/scripts/barbican_secret.py"
+          - create
+          - --cloud
+          - "{{ openstack.cloud }}"
+          - --region
+          - "{{ openstack.region_name | default('') }}"
+          - --name
+          - "{{ lb_name }}-{{ scenario_slug }}-backend-ca"
+          - --file
+          - "{{ root_dir }}/state/tls/ca.crt"
+          - --content-type
+          - application/octet-stream
+      register: backend_ca_secret_cmd
+      when: scenario.backend_reencrypt | default(false) | bool
+      changed_when: true
+
+    - name: Parse backend CA Barbican secret
+      ansible.builtin.set_fact:
+        backend_ca_secret: "{{ backend_ca_secret_cmd.stdout | from_json }}"
+      when: scenario.backend_reencrypt | default(false) | bool
+
+    - name: Persist backend CA secret immediately for failure-safe cleanup
+      ansible.builtin.copy:
+        dest: "{{ root_dir }}/state/current_secrets.yml"
+        mode: "0600"
+        content: |
+          secret_refs:
+          {% if scenario.frontend_tls_termination | default(false) | bool %}
+            - {{ frontend_secret.secret_ref | to_json }}
+          {% endif %}
+            - {{ backend_ca_secret.secret_ref | to_json }}
+      when: scenario.backend_reencrypt | default(false) | bool
+
+    - name: Create scenario listener on persistent load balancer
+      openstack.cloud.lb_listener:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ listener_name }}"
+        load_balancer: "{{ lb_name }}"
+        protocol: "{{ scenario.listener_protocol }}"
+        protocol_port: "{{ scenario.listener_port }}"
+        default_tls_container_ref: "{{ frontend_secret.secret_ref if scenario.frontend_tls_termination | default(false) | bool else omit }}"
+        wait: true
+        timeout: 600
+        state: present
+      register: listener
+
+    - name: Apply benchmark listener limits, timeouts, and optional TLS settings
+      ansible.builtin.command:
+        argv:
+          - "{{ root_dir }}/.venv/bin/python"
+          - "{{ root_dir }}/scripts/octavia_tls.py"
+          - listener
+          - --cloud
+          - "{{ openstack.cloud }}"
+          - --region
+          - "{{ openstack.region_name | default('') }}"
+          - --listener-id
+          - "{{ listener.listener.id }}"
+          - --tls-versions
+          - "{{ (tls.listener_tls_versions | default([]) | join(',')) if scenario.frontend_tls_termination | default(false) | bool else '' }}"
+          - --tls-ciphers
+          - "{{ (tls.listener_tls_ciphers | default('') or '') if scenario.frontend_tls_termination | default(false) | bool else '' }}"
+          - --connection-limit
+          - "{{ listener_connection_limit_effective }}"
+          - --timeout-client-data
+          - "{{ octavia.listener.timeout_client_data_ms | default(300000) }}"
+          - --timeout-member-data
+          - "{{ octavia.listener.timeout_member_data_ms | default(300000) }}"
+      register: listener_tuning_cmd
+      changed_when: true
+
+    - name: Parse applied listener benchmark settings
+      ansible.builtin.set_fact:
+        listener_tuning: "{{ listener_tuning_cmd.stdout | from_json }}"
+
+    - name: Create scenario pool
+      openstack.cloud.lb_pool:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ pool_name }}"
+        listener: "{{ listener_name }}"
+        protocol: "{{ scenario.pool_protocol }}"
+        lb_algorithm: "{{ octavia.lb_algorithm }}"
+        wait: true
+        timeout: 600
+        state: present
+      register: pool
+
+    - name: Enable TLS re-encryption to backend members
+      ansible.builtin.command:
+        argv:
+          - "{{ root_dir }}/.venv/bin/python"
+          - "{{ root_dir }}/scripts/octavia_tls.py"
+          - pool
+          - --cloud
+          - "{{ openstack.cloud }}"
+          - --region
+          - "{{ openstack.region_name | default('') }}"
+          - --pool-id
+          - "{{ pool.pool.id }}"
+          - --ca-ref
+          - "{{ backend_ca_secret.secret_ref }}"
+          - --tls-versions
+          - "{{ tls.pool_tls_versions | default([]) | join(',') }}"
+          - --tls-ciphers
+          - "{{ tls.pool_tls_ciphers | default('') or '' }}"
+      register: pool_tls_update
+      when: scenario.backend_reencrypt | default(false) | bool
+      changed_when: true
+
+    - name: Add backend members
+      openstack.cloud.lb_member:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ item }}"
+        pool: "{{ pool_name }}"
+        address: "{{ hostvars[item].private_ip }}"
+        protocol_port: "{{ scenario.member_port }}"
+        subnet_id: "{{ campaign_lb.vip_subnet_id }}"
+        wait: true
+        timeout: 600
+        state: present
+      loop: "{{ groups['backends'] }}"
+
+    - name: Create health monitor
+      openstack.cloud.lb_health_monitor:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ hm_name }}"
+        pool: "{{ pool_name }}"
+        type: "{{ scenario.health_monitor_type }}"
+        delay: "{{ octavia.health_monitor.delay }}"
+        health_monitor_timeout: "{{ octavia.health_monitor.timeout }}"
+        max_retries: "{{ octavia.health_monitor.max_retries }}"
+        max_retries_down: "{{ octavia.health_monitor.max_retries_down }}"
+        http_method: GET
+        url_path: "{{ backend.health_path }}"
+        expected_codes: "200"
+        wait: true
+        timeout: 600
+        state: present
+
+    - name: Persist current scenario target
+      ansible.builtin.copy:
+        dest: "{{ root_dir }}/state/current_target.yml"
+        mode: "0600"
+        content: |
+          benchmark_id: {{ benchmark_id | to_json }}
+          suite_id: {{ suite_id | default(campaign_id) | to_json }}
+          campaign_id: {{ campaign_id | to_json }}
+          target_kind: octavia
+          persistent_load_balancer: true
+          scenario_name: {{ scenario_name | to_json }}
+          scenario_description: {{ scenario.description | default(None) | to_json }}
+          traffic_path: {{ campaign_lb.traffic_path | to_json }}
+          external_network_mtu: {{ campaign_lb.external_network_mtu | default(1500) | int | to_json }}
+          scheme: {{ scenario.scheme | to_json }}
+          benchmark_path: {{ scenario.benchmark_path | to_json }}
+          benchmark_engine: {{ scenario.benchmark_engine | default('locust') | to_json }}
+          locust_profile: {{ scenario.locust_profile | default('staircase') | to_json }}
+          capacity_mode: {{ scenario.capacity_mode | default(None) | to_json }}
+          capacity_profile: {{ scenario.capacity_profile | default('standard') | to_json }}
+          connection_mode: {{ scenario.connection_mode | to_json }}
+          frontend_tls_termination: {{ scenario.frontend_tls_termination | default(false) | bool | to_json }}
+          backend_tls: {{ scenario.backend_tls | default(false) | bool | to_json }}
+          backend_reencrypt: {{ scenario.backend_reencrypt | default(false) | bool | to_json }}
+          listener_protocol: {{ scenario.listener_protocol | to_json }}
+          listener_port: {{ scenario.listener_port | to_json }}
+          listener_connection_limit: {{ listener_tuning.connection_limit | default(listener_connection_limit_effective) | to_json }}
+          listener_timeout_client_data_ms: {{ listener_tuning.timeout_client_data | default(octavia.listener.timeout_client_data_ms | default(None)) | to_json }}
+          listener_timeout_member_data_ms: {{ listener_tuning.timeout_member_data | default(octavia.listener.timeout_member_data_ms | default(None)) | to_json }}
+          pool_protocol: {{ scenario.pool_protocol | to_json }}
+          member_port: {{ scenario.member_port | to_json }}
+          health_monitor_type: {{ scenario.health_monitor_type | to_json }}
+          octavia_flavor: {{ campaign_lb.octavia_flavor | to_json }}
+          load_balancer_name: {{ campaign_lb.load_balancer_name | to_json }}
+          load_balancer_id: {{ campaign_lb.load_balancer_id | to_json }}
+          listener_id: {{ listener.listener.id | to_json }}
+          pool_id: {{ pool.pool.id | to_json }}
+          provider: {{ campaign_lb.provider | default(None) | to_json }}
+          flavor_id: {{ campaign_lb.flavor_id | default(None) | to_json }}
+          vip_network_id: {{ campaign_lb.vip_network_id | default(None) | to_json }}
+          vip_subnet_id: {{ campaign_lb.vip_subnet_id | default(None) | to_json }}
+          target_host: {{ campaign_lb.target_host | to_json }}
+          target_url: {{ (scenario.scheme + '://' + campaign_lb.target_host + ':' + (scenario.listener_port | string)) | to_json }}
+          vip_address: {{ campaign_lb.vip_address | to_json }}
+          listener_tls_secret_ref: {{ (frontend_secret.secret_ref if scenario.frontend_tls_termination | default(false) | bool else None) | to_json }}
+          backend_ca_secret_ref: {{ (backend_ca_secret.secret_ref if scenario.backend_reencrypt | default(false) | bool else None) | to_json }}
+

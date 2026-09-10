@@ -62,7 +62,7 @@ The `*_max_rps` scenarios are different from the normal fixed Locust staircase. 
 
 The `*_max_connections_active` scenarios scale their global connection targets from `connection_capacity.max_levels_per_worker × vm.locust.worker_vms`. The default last per-worker target is 55,000, matching the source-port guard. If every level passes, the report says the generator-safe ceiling was reached and tells you to add generator VMs/source IPs before claiming an Octavia maximum.
 
-The harness also raises and records the benchmark listener `connection_limit` and client/member inactivity timeouts so an API policy cap or idle timeout is not mistaken for the flavor's resource ceiling.
+The harness also raises and records the benchmark listener `connection_limit` and client/member inactivity timeouts so an API policy cap or idle timeout is not mistaken for the flavor's resource ceiling. Normal request-rate, churn, and bandwidth tests use `octavia.listener.connection_limit` (100,000 by default); simultaneous connection-capacity tests use the separate `octavia.listener.capacity_connection_limit` (1,000,000 by default) so an oversized HAProxy `maxconn` is not carried into every RPS test.
 
 Enable opt-in profiles by adding their names to `scenarios.enabled`, or select a subset for one campaign with repeated `--scenario` arguments. See [`docs/SCENARIOS.md`](docs/SCENARIOS.md) for the measurement semantics and [`docs/USAGE.md`](docs/USAGE.md) for campaign examples.
 
@@ -140,6 +140,14 @@ generator_network:
 
 The Locust master is dual-homed in the dedicated modes: its workload NIC remains on the backend network for SSH/jump-host management, while its generator NIC communicates directly with Locust workers. The workers themselves have only the generator-network NIC, so benchmark requests cannot accidentally originate on the management/backend network. The harness removes the generator-side default route from the dual-homed master so its public SSH/FIP return path remains pinned to the workload/control NIC.
 
+### FIP MTU handling
+
+The harness preserves the cloud-native tenant-network MTU for benchmark traffic, but it does not assume that a jumbo tenant MTU can traverse the external/FIP network unchanged. During provisioning it queries `network.external_network` for its MTU and, by default, installs a temporary `/32` route on the Ansible controller for the newly allocated master FIP using that external MTU. SSH-dependent playbooks (`configure`, benchmark execution, and result collection) reconcile that route again before contacting the master, so a controller reboot, DHCP renewal, or network-service restart cannot silently remove the workaround. The prior route is restored by `make destroy`. This avoids SSH/Ansible stalls when the controller lives on a jumbo tenant network but PUBLICNET is 1500 bytes. Disable this with `ssh.manage_controller_fip_route: false` if the controller route is managed outside the harness; `ssh.controller_fip_mtu` can override the discovered MTU.
+
+For `benchmark.traffic_path: floating_ip`, the same external-network MTU is applied as a temporary per-target route on the Locust master/workers before each FIP benchmark and restored afterward. This keeps FIP tests on the real public-path MTU while leaving tenant-VIP benchmarks at the tenant network's native MTU.
+
+Private-node SSH is validated in two stages: the master must first establish TCP/22 to every backend/worker address, then Ansible performs the SSH handshake through an explicit `ProxyCommand` that supplies the generated benchmark key to the jump-host hop. This makes routing/security-group failures distinct from SSH key/proxy failures.
+
 A direct-to-nginx baseline is possible in `shared` and `dedicated_routed`. It is automatically skipped in `dedicated_external`, because lack of a private generator-to-backend route is an intentional part of that topology. The resolved generator mode, network/subnet/CIDR, isolation state, and master workload/generator IPs are captured in every run manifest and included in the comparison fingerprint.
 
 ## TLS and Barbican behavior
@@ -183,59 +191,6 @@ make benchmark CONFIG=config/local.yml
 
 `ansible.cfg` sets `roles_path = ./roles`, so the repository-level `roles/common`, `roles/backend`, and `roles/locust` roles are resolved even though the playbooks live under `playbooks/`. `make validate` also syntax-checks `playbooks/configure.yml` first so a missing or mispackaged role is caught before cloud resources are provisioned.
 
-
-## One-command clean baseline suite
-
-For a reproducible baseline of a single Octavia flavor, use the repository runbook:
-
-```bash
-chmod +x scripts/run_baseline_suite.sh
-./scripts/run_baseline_suite.sh
-```
-
-By default the runbook uses `config/local.yml`, flavor `amphora-default`, and three repetitions. It:
-
-1. preserves the existing `results/` directory;
-2. validates the canonical baseline settings (`8000` users at a final `spawn_rate` of `1000`, and `max_rps.start_users: 500`);
-3. runs `make destroy`;
-4. removes generated `state/*` while retaining `state/.gitkeep`;
-5. runs `make provision` and `make configure`;
-6. verifies Ansible connectivity and the nginx backend HTTP endpoint; and
-7. runs the HTTP, TLS-passthrough, and TLS-termination keepalive, connection-churn, and max-RPS baseline scenarios sequentially.
-
-The default scenario list is:
-
-```text
-http_1k_keepalive
-http_1k_max_rps
-http_1k_connection_churn
-tls_passthrough_1k_keepalive
-tls_passthrough_1k_connection_churn
-tls_passthrough_1k_max_rps
-tls_termination_1k_keepalive
-tls_termination_1k_connection_churn
-tls_termination_1k_max_rps
-```
-
-The runbook deliberately does **not** delete historical benchmark results. Full orchestration output is also written to `results/baseline-suite-<UTC timestamp>.log`.
-
-Override the flavor, configuration, or repetition count without editing the script:
-
-```bash
-CONFIG=config/local.yml \
-FLAVOR=amphora-default \
-REPETITIONS=3 \
-./scripts/run_baseline_suite.sh
-```
-
-If the reusable fleet is already freshly provisioned and configured, skip teardown/rebuild:
-
-```bash
-REBUILD=0 ./scripts/run_baseline_suite.sh
-```
-
-Keep the canonical workload settings and the benchmark Git revision unchanged when collecting a baseline that will later be compared with additional Octavia flavors or dedicated aggregates.
-
 Run selected scenarios/flavors without editing the file:
 
 ```bash
@@ -252,6 +207,43 @@ If backend addresses change, regenerate and reinstall backend certificates with:
 ```bash
 make configure CONFIG=config/local.yml
 ```
+
+## Canonical baseline-suite workflow
+
+For a controlled single-flavor characterization campaign, prefer:
+
+```bash
+./scripts/run_baseline_suite.sh
+```
+
+The baseline runbook deliberately separates infrastructure controls from Octavia testing:
+
+```text
+reusable generator/backend fleet
+    |
+    +-- direct-to-nginx controls, once per suite
+    |
+    +-- create one persistent Octavia LB/amphora for the selected flavor
+            |
+            +-- scenario 1: create listener/pool/members/HM -> test -> delete children
+            +-- scenario 2: create listener/pool/members/HM -> test -> delete children
+            +-- ...
+            +-- all repetitions use the same LB/amphora
+            |
+            +-- delete the persistent LB after the Octavia phase
+```
+
+The persistent-LB mode avoids rebuilding the Amphora between scenarios or repetitions. This reduces provisioning noise and keeps Nova placement, CPU model, virtual NICs, and the Amphora image constant for the campaign. HTTP, TLS passthrough, and TLS termination still get their own scenario-specific listener/pool configuration; only those child resources are replaced.
+
+For an experimental Octavia flavor that must be disabled after first use, pause immediately after the persistent LB is provisioned:
+
+```bash
+PAUSE_AFTER_LB_CREATE=1 ./scripts/run_baseline_suite.sh
+```
+
+The script prints the persistent LB ID/VIP and waits for Enter. At that point the LB/amphora already exists, so the flavor can be disabled before benchmark scenarios begin. The baseline runbook creates one persistent LB for `FLAVOR`; manual `benchmark.py --reuse-load-balancer` creates one persistent LB per selected flavor.
+
+Standalone `benchmark.py` remains backward-compatible: unless `--reuse-load-balancer` is supplied, normal Octavia runs create and destroy a load balancer per run.
 
 ## Results and historical documentation
 
@@ -310,8 +302,8 @@ The default concurrency staircase is 250, 500, 1k, 2k, 4k, then 8k concurrent Lo
 For comparative work:
 
 1. Keep the Nova flavors, image, backend count, worker count, scenario, traffic path, **generator-network mode**, and staircase unchanged.
-2. Use direct backend baselines to prove client/backend headroom where the scenario and network topology allow them; `dedicated_external` intentionally cannot run a private direct baseline.
-3. Test Octavia flavor/scenario combinations serially, not simultaneously.
+2. Use direct backend baselines to prove client/backend headroom where the scenario and network topology allow them; the canonical baseline runbook collects each selected direct control once because the reusable generator/backend fleet does not change. `dedicated_external` intentionally cannot run a private direct baseline.
+3. Test Octavia flavor/scenario combinations serially, not simultaneously. The canonical baseline runbook reuses one LB/amphora for the selected flavor and replaces only scenario child resources between tests.
 4. Keep the default three randomized repetitions (or increase them) and compare medians and variance.
 5. Reject or rerun results where generator/backend CPU or network is the bottleneck.
 6. Compare HTTP, passthrough, termination, re-encryption, connection churn, and payload sizes as separate populations.
@@ -327,7 +319,7 @@ Backends are deliberately not containerized. Ansible installs nginx directly, di
 
 ## Provider capability caveat
 
-Octavia provider drivers do not necessarily expose the same TLS feature set. If a flavor/provider does not support TLS termination or TLS-enabled backend pools, that scenario can fail during LB creation even though the HTTP control scenario works. Treat that as an explicit provider capability result rather than silently falling back to a different datapath.
+Octavia provider drivers do not necessarily expose the same TLS feature set. If a flavor/provider does not support TLS termination or TLS-enabled backend pools, that scenario can fail while its listener/pool resources are configured even though the persistent LB and HTTP control scenario work. Treat that as an explicit provider capability result rather than silently falling back to a different datapath.
 
 ## Teardown
 
@@ -335,12 +327,13 @@ Octavia provider drivers do not necessarily expose the same TLS feature set. If 
 make destroy CONFIG=config/local.yml
 ```
 
-The destroy playbook tries every configured flavor/scenario LB name, cleans an outstanding per-run Barbican secret state if one exists, removes the compute resources, then tears down any harness-created generator router/subnet/network before removing the benchmark network. Keep a unique `run_prefix` when multiple operators share a project.
+The canonical baseline runbook deletes its persistent campaign LB in a `finally` cleanup after the Octavia phase. `make destroy` remains the full environment cleanup path: it cleans outstanding benchmark LBs/secrets and removes the compute resources and any harness-created generator/network resources. Keep a unique `run_prefix` when multiple operators share a project.
 
 ## Detailed documentation
 
 - [`docs/SCENARIOS.md`](docs/SCENARIOS.md) — what every scenario measures, idle vs active capacity, generator-side false ceilings, and recommended comparison sets.
 - [`docs/USAGE.md`](docs/USAGE.md) — setup, validation, copy/paste commands, tenant-VIP/FIP examples, connection-capacity tuning, and larger campaigns.
+- [`docs/AMPHORA_PERFORMANCE_TUNING.md`](docs/AMPHORA_PERFORMANCE_TUNING.md) — Octavia/HAProxy logging, generated-config checks, one-vCPU diagnostics, image tuning, CPU pinning, and multiqueue/SR-IOV follow-up tests.
 
 ## Useful next extensions
 
@@ -378,3 +371,34 @@ roles_path = ./roles
 ```
 
 If you invoke Ansible from another working directory, either `cd` to the repository root first or set `ANSIBLE_CONFIG=/path/to/octavia-perf-tool/ansible.cfg`.
+
+### Resilient baseline campaigns
+
+`scripts/run_baseline_suite.sh` creates the campaign LB once and treats failure of that initial provisioning as recoverable. By default it captures failed-LB diagnostics, cleans up the failed object, and retries creation up to three total attempts. Once the persistent LB exists, scenario failures are isolated to the listener/pool/member/health-monitor resources; cleanup removes those children while retaining the Amphora so later scenarios can continue. See `docs/USAGE.md` for the full lifecycle, artifact names, pause workflow, and retry controls.
+
+## Combined comparison after separate flavor suites
+
+If you run `scripts/run_baseline_suite.sh` once per Octavia flavor, you do not need to rerun the benchmarks together to compare them. Keep the result directories under `results/` and run:
+
+```bash
+make campaign-report
+```
+
+This creates `results/campaign-comparison/` with a concise `README.md`, a detailed scenario-by-scenario report, CSV scorecards, and overview/per-scenario charts. The first chart to open is `results/campaign-comparison/charts/composite-dashboard.png`: a single presentation-ready view containing overall flavor performance, scenario wins, the all-scenario performance and p99-latency matrices, run-to-run variability, and flavor-scoped direct-nginx efficiency where available. The default selection uses the latest three successful runs per flavor/scenario so older history is not silently mixed into a current four-flavor comparison.
+
+For an explicit set and reference flavor:
+
+```bash
+.venv/bin/python scripts/compare_campaigns.py results \
+  --flavor flavor-a --flavor flavor-b --flavor flavor-c --flavor flavor-d \
+  --reference-flavor flavor-a
+```
+
+See `docs/USAGE.md` for report semantics, selection controls, fingerprint checks, and generated artifacts.
+
+### One-flavor suite identity and verified LB flavor
+
+The canonical baseline runbook runs one Octavia flavor at a time. Use `FLAVOR=<name>` explicitly when the config lists multiple Octavia flavors. If the config has exactly one flavor, omitting `FLAVOR` uses that configured value; the runbook no longer silently falls back to `amphora-default`.
+
+Each suite gets a `suite_id` shared by its direct controls and Octavia runs. Direct controls carry `baseline_for_flavor` for provenance while remaining `target_kind=direct`. Persistent LB creation resolves the requested Octavia flavor to a UUID and verifies the created LB's `flavor_id` before benchmark traffic begins. Combined campaign reports keep legacy unscoped direct controls separate rather than assigning them to a flavor implicitly.
+

@@ -54,6 +54,19 @@ def main() -> None:
     if str(cidr) == "0.0.0.0/0":
         die("refusing ssh.operator_cidr=0.0.0.0/0; use your public /32 or trusted CIDR")
 
+    controller_mtu = (cfg.get("ssh") or {}).get("controller_fip_mtu", "auto")
+    if str(controller_mtu) != "auto":
+        try:
+            controller_mtu_int = int(controller_mtu)
+        except (TypeError, ValueError):
+            die("ssh.controller_fip_mtu must be 'auto' or an integer")
+        if not 576 <= controller_mtu_int <= 65535:
+            die("ssh.controller_fip_mtu must be between 576 and 65535")
+    for key in ("connect_timeout_seconds", "readiness_timeout_seconds", "private_tcp_timeout_seconds", "readiness_serial", "configure_serial", "retries"):
+        value = int((cfg.get("ssh") or {}).get(key, 1))
+        if value <= 0:
+            die(f"ssh.{key} must be > 0")
+
     for role, key in (("backend", "count"), ("locust", "worker_vms")):
         value = int(cfg["vm"][role][key])
         if value < 1:
@@ -186,10 +199,27 @@ def main() -> None:
                 die(f"scenario {name}: payload {size} is not in backend.payload_sizes")
 
 
+    listener_cfg = (cfg.get("octavia") or {}).get("listener") or {}
+    normal_connection_limit = int(listener_cfg.get("connection_limit", 100000))
+    capacity_connection_limit = int(listener_cfg.get("capacity_connection_limit", 1000000))
+    if normal_connection_limit <= 0:
+        die("octavia.listener.connection_limit must be > 0")
+    if capacity_connection_limit <= 0:
+        die("octavia.listener.capacity_connection_limit must be > 0")
+    if capacity_connection_limit < normal_connection_limit:
+        die("octavia.listener.capacity_connection_limit must be >= octavia.listener.connection_limit")
+
     max_rps_required = any(
         isinstance(scenario, dict) and str(scenario.get("locust_profile", "staircase")) == "max_rps"
         for scenario in catalog.values()
     )
+    if max_rps_required:
+        configured_max_users = int((cfg.get("max_rps") or {}).get("max_users", 0))
+        if configured_max_users > 0 and normal_connection_limit < configured_max_users:
+            die(
+                "octavia.listener.connection_limit must be >= max_rps.max_users "
+                "so listener policy does not cap the adaptive RPS search"
+            )
     if max_rps_required:
         max_cfg = cfg.get("max_rps") or {}
         for key in ("start_users", "max_users", "spawn_rate", "measure_seconds", "max_search_steps", "search_resolution_users"):
@@ -276,11 +306,12 @@ def main() -> None:
                 "by at least 1024 descriptors"
             )
         listener_cfg = (cfg.get("octavia") or {}).get("listener") or {}
-        listener_limit = int(listener_cfg.get("connection_limit", 0))
+        listener_limit = int(listener_cfg.get("capacity_connection_limit", 1000000))
         if listener_limit < max_global_target:
             die(
-                "octavia.listener.connection_limit must be >= the highest effective connection_capacity level; "
-                "otherwise the configured listener policy becomes the measured ceiling"
+                "octavia.listener.capacity_connection_limit must be >= the highest effective "
+                "connection_capacity level; otherwise the configured listener policy becomes "
+                "the measured ceiling"
             )
         hold_ms = float(capacity.get("hold_seconds", 0)) * 1000.0
         client_timeout_ms = int(listener_cfg.get("timeout_client_data_ms", 0))
@@ -319,3 +350,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

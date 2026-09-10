@@ -81,6 +81,7 @@ def harness_hash(repo_root: Path) -> str:
         "playbooks/prepare_tls.yml",
         "scripts/benchmark.py",
         "scripts/topology.py",
+        "scripts/controller_fip_route.py",
         "playbooks/provision.yml",
         "templates/inventory.ini.j2",
         "scripts/tls_material.py",
@@ -162,11 +163,15 @@ def manifest_markdown(manifest: dict[str, Any]) -> str:
 
     rows = [
         ("Benchmark ID", manifest["benchmark_id"]),
+        ("Suite ID", safe((manifest.get("target") or {}).get("suite_id") or (manifest.get("target") or {}).get("campaign_id"))),
+        ("Direct control for flavor", safe((manifest.get("target") or {}).get("baseline_for_flavor"))),
         ("Captured (UTC)", manifest["captured_at_utc"]),
         ("Load window (UTC)", f"{safe((manifest.get('timing') or {}).get('load_test_started_at_utc'))} -> {safe((manifest.get('timing') or {}).get('load_test_completed_at_utc'))}"),
         ("Comparison fingerprint", manifest["comparison_fingerprint"]),
         ("Scenario", f"{scenario.get('name')} - {safe(scenario.get('description'))}"),
         ("Traffic path", scenario.get("traffic_path")),
+        ("External network MTU", safe((manifest.get("network") or {}).get("external_network_mtu"))),
+        ("Controller FIP route", f"managed={safe((manifest.get('network') or {}).get('controller_fip_route_managed'))}, mtu={safe((manifest.get('network') or {}).get('controller_fip_route_mtu'))}"),
         ("Generator network", f"{safe(generator_network.get('resolved_mode'))} / {safe(generator_network.get('network_name'))} / {safe(generator_network.get('cidr'))}"),
         ("Generator/backend isolation", safe(generator_network.get("isolated_from_backends"))),
         ("Direct backend reachable", safe(generator_network.get("direct_backend_reachable"))),
@@ -300,6 +305,10 @@ def build_manifest(result_dir: Path) -> dict[str, Any]:
     target = load_yaml(result_dir / "target.yml")
     cfg = load_yaml(result_dir / "config-effective.yml")
     infra = load_yaml(result_dir / "infrastructure.yml")
+    network_manifest = dict(cfg.get("network") or {})
+    network_manifest["external_network_mtu"] = infra.get("external_network_mtu")
+    network_manifest["controller_fip_route_managed"] = bool(infra.get("controller_fip_route_managed", False))
+    network_manifest["controller_fip_route_mtu"] = infra.get("controller_fip_route_mtu")
     timing = load_yaml(result_dir / "timing.yml")
     tls_material_path = result_dir / "tls-material.json"
     tls_material = json.loads(tls_material_path.read_text()) if tls_material_path.exists() else {}
@@ -365,7 +374,7 @@ def build_manifest(result_dir: Path) -> dict[str, Any]:
         "target": target,
         "scenario": scenario,
         "cloud": cfg.get("openstack") or {},
-        "network": cfg.get("network") or {},
+        "network": network_manifest,
         "generator_network": {
             "configured": generator_network_cfg,
             "configured_mode": generator_network_cfg.get("mode", "auto"),
@@ -533,3 +542,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

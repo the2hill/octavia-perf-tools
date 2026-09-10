@@ -1,0 +1,47 @@
+---
+- name: Delete persistent Octavia campaign load balancer
+  hosts: localhost
+  gather_facts: false
+  vars:
+    root_dir: "{{ playbook_dir }}/.."
+    use_fip: "{{ (benchmark.traffic_path | default('tenant_vip')) == 'floating_ip' }}"
+    flavor_slug: "{{ (octavia_flavor | default('default')) | regex_replace('[^A-Za-z0-9_.-]', '-') }}"
+    state_file: "{{ root_dir }}/state/campaign_lb-{{ flavor_slug }}-{{ campaign_id }}.yml"
+  tasks:
+    - name: Check persistent campaign LB state file
+      ansible.builtin.stat:
+        path: "{{ state_file }}"
+      register: campaign_state_file
+
+    - name: Load persistent campaign LB state
+      ansible.builtin.include_vars:
+        file: "{{ state_file }}"
+        name: campaign_lb
+      when: campaign_state_file.stat.exists
+
+    - name: Select persistent campaign load balancer name
+      ansible.builtin.set_fact:
+        campaign_lb_name_effective: >-
+          {{
+            campaign_lb.load_balancer_name
+            if campaign_state_file.stat.exists
+            else run_prefix ~ '-' ~ flavor_slug ~ '-campaign-' ~ campaign_id
+          }}
+
+    - name: Delete persistent campaign load balancer and all remaining children
+      openstack.cloud.loadbalancer:
+        cloud: "{{ openstack.cloud }}"
+        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        name: "{{ campaign_lb_name_effective }}"
+        delete_floating_ip: "{{ use_fip | bool }}"
+        state: absent
+        wait: true
+        timeout: 900
+      failed_when: false
+
+    - name: Remove persistent campaign LB state file
+      ansible.builtin.file:
+        path: "{{ state_file }}"
+        state: absent
+      when: campaign_state_file.stat.exists
+

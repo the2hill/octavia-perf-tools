@@ -18,9 +18,11 @@
         mode: "0600"
         content: |
           benchmark_id: {{ benchmark_id | to_json }}
+          suite_id: {{ suite_id | default(None) | to_json }}
+          baseline_for_flavor: {{ baseline_for_flavor | default(None) | to_json }}
           target_kind: direct
           scenario_name: {{ scenario_name | to_json }}
-          scenario_description: {{ ('Direct baseline for ' + (scenario.description | default(scenario_name))) | to_json }}
+          scenario_description: {{ ('Direct backend control for ' + (scenario.description | default(scenario_name)) + ((' [suite flavor: ' + baseline_for_flavor + ']') if baseline_for_flavor is defined and baseline_for_flavor else '')) | to_json }}
           traffic_path: direct_backend
           scheme: {{ direct_scheme | to_json }}
           benchmark_path: {{ scenario.benchmark_path | to_json }}
@@ -51,3 +53,4 @@
           vip_address: null
           listener_tls_secret_ref: null
           backend_ca_secret_ref: null
+
