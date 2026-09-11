@@ -460,6 +460,19 @@ def prepare_campaign_lb(
                 campaign_id=slug(campaign_id),
             )
             state_path = campaign_lb_state_path(flavor, campaign_id)
+            run(
+                str(PYTHON),
+                "scripts/amphora_inventory.py",
+                "capture",
+                "--config",
+                str(config),
+                "--state-file",
+                str(state_path),
+                "--registry-file",
+                str(ROOT / "state" / "current_campaign_lbs.yml"),
+                "--archive-file",
+                str(result_dir / "campaign-state.yml"),
+            )
             state = yaml.safe_load(state_path.read_text()) or {}
             actual_flavor_id = str(state.get("flavor_id") or "")
             if resolved_flavor_id and actual_flavor_id != resolved_flavor_id:
@@ -473,6 +486,20 @@ def prepare_campaign_lb(
             print(f"  name:   {state.get('load_balancer_name', lb_name)}", flush=True)
             print(f"  id:     {state.get('load_balancer_id', '<unknown>')}", flush=True)
             print(f"  VIP:    {state.get('vip_address', '<unknown>')}", flush=True)
+            for amphora in state.get("amphorae") or []:
+                print(
+                    "  Amphora: "
+                    f"role={amphora.get('role')} "
+                    f"id={amphora.get('amphora_id')} "
+                    f"compute_id={amphora.get('compute_id')} "
+                    f"domain={amphora.get('instance_name')} "
+                    f"host={amphora.get('compute_host')}",
+                    flush=True,
+                )
+            print(
+                f"  Live registry: {ROOT / 'state' / 'current_campaign_lbs.yml'}",
+                flush=True,
+            )
             print(
                 "  This LB/amphora will be reused for all Octavia scenarios and repetitions.",
                 flush=True,
@@ -529,6 +556,26 @@ def destroy_campaign_lb(config: pathlib.Path, *, flavor: str, campaign_id: str) 
         print(
             f"WARNING: final persistent load-balancer cleanup failed for flavor {flavor} "
             f"(rc={exc.returncode}).",
+            flush=True,
+        )
+        return
+
+    try:
+        run(
+            str(PYTHON),
+            "scripts/amphora_inventory.py",
+            "remove",
+            "--registry-file",
+            str(ROOT / "state" / "current_campaign_lbs.yml"),
+            "--campaign-id",
+            slug(campaign_id),
+            "--octavia-flavor",
+            flavor,
+        )
+    except subprocess.CalledProcessError as exc:
+        print(
+            f"WARNING: persistent LB was deleted but live campaign registry cleanup failed "
+            f"for flavor {flavor} (rc={exc.returncode}).",
             flush=True,
         )
 

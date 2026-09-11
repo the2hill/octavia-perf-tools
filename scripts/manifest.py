@@ -78,8 +78,11 @@ def harness_hash(repo_root: Path) -> str:
         "roles/common/tasks/main.yml",
         "playbooks/run_test.yml",
         "playbooks/create_lb.yml",
+        "playbooks/create_campaign_lb.yml",
+        "playbooks/configure_campaign_lb_scenario.yml",
         "playbooks/prepare_tls.yml",
         "scripts/benchmark.py",
+        "scripts/amphora_inventory.py",
         "scripts/topology.py",
         "scripts/controller_fip_route.py",
         "playbooks/provision.yml",
@@ -238,6 +241,14 @@ def manifest_markdown(manifest: dict[str, Any]) -> str:
         ("Pool ID", target.get("pool_id")),
         ("Provider", target.get("provider")),
         ("Flavor ID", target.get("flavor_id")),
+        ("Amphora count", target.get("amphora_count")),
+        ("Primary Amphora ID", target.get("amphora_id")),
+        ("Primary Amphora role", target.get("amphora_role")),
+        ("Primary Amphora compute ID", target.get("amphora_compute_id")),
+        ("Primary libvirt domain", target.get("amphora_instance_name")),
+        ("Primary compute host", target.get("amphora_compute_host")),
+        ("Primary hypervisor hostname", target.get("amphora_hypervisor_hostname")),
+        ("Prometheus libvirt domain regex", target.get("prometheus_libvirt_domain_regex")),
         ("VIP", target.get("vip_address")),
         ("Target host", target.get("target_host")),
         ("Target URL", target.get("target_url")),
@@ -245,6 +256,27 @@ def manifest_markdown(manifest: dict[str, Any]) -> str:
         ("Barbican backend CA secret used", bool(target.get("backend_ca_secret_ref"))),
     ]:
         lines.append(f"- **{label}:** {safe(value)}")
+    amphorae = target.get("amphorae") or []
+    if amphorae:
+        lines += ["", "## Amphora / Nova identity", "", "| Role | Amphora ID | Compute ID | Libvirt domain | Compute host | Hypervisor | Mgmt IP |", "|---|---|---|---|---|---|---|"]
+        for amphora in amphorae:
+            lines.append(
+                "| "
+                + " | ".join(
+                    safe(amphora.get(key))
+                    for key in [
+                        "role",
+                        "amphora_id",
+                        "compute_id",
+                        "instance_name",
+                        "compute_host",
+                        "hypervisor_hostname",
+                        "lb_network_ip",
+                    ]
+                )
+                + " |"
+            )
+
     tls_cfg = manifest.get("tls") or {}
     lines.append(f"- **Configured frontend TLS versions:** {safe(tls_cfg.get('listener_tls_versions'))}")
     lines.append(f"- **Configured frontend TLS ciphers:** {safe(tls_cfg.get('listener_tls_ciphers'))}")
@@ -365,7 +397,7 @@ def build_manifest(result_dir: Path) -> dict[str, Any]:
     }
 
     manifest: dict[str, Any] = {
-        "schema_version": 5,
+        "schema_version": 6,
         "benchmark_id": target.get("benchmark_id") or result_dir.name,
         "captured_at_utc": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat(),
         "timing": timing,
@@ -464,6 +496,12 @@ def build_manifest(result_dir: Path) -> dict[str, Any]:
             "lb_algorithm": octavia_cfg.get("lb_algorithm"),
             "health_monitor": octavia_cfg.get("health_monitor") or {},
             "traffic_path": scenario["traffic_path"],
+            "amphora_inventory_captured_at_utc": target.get("amphora_inventory_captured_at_utc"),
+            "amphora_count": target.get("amphora_count"),
+            "amphorae": target.get("amphorae") or [],
+            "primary_amphora": target.get("primary_amphora") or {},
+            "prometheus_libvirt_domains": target.get("prometheus_libvirt_domains") or [],
+            "prometheus_libvirt_domain_regex": target.get("prometheus_libvirt_domain_regex"),
         },
         "tls": {
             "enabled": tls_cfg.get("enabled"),

@@ -620,3 +620,48 @@ Before persistent-LB creation, `benchmark.py` resolves the requested Octavia fla
 
 For combined reports, new direct controls are associated with their matching `baseline_for_flavor`. Direct controls created before this provenance change appear as `legacy_unscoped`; they are retained for context but are not silently assigned to a flavor-specific Octavia-to-direct ratio.
 
+## Amphora identity and historical Prometheus correlation
+
+Persistent-LB creation captures Amphora and Nova identity before benchmark traffic starts. During a live campaign use:
+
+```bash
+cat state/current_campaign_lbs.yml
+```
+
+The registry supports one or several simultaneously prepared flavors. Each entry includes `load_balancer_id`, `octavia_flavor`, the full `amphorae` list, `primary_amphora`, and `prometheus_libvirt_domains`. For a single/standalone Amphora the convenience fields propagated to each run include:
+
+```yaml
+amphora_id: <octavia-amphora-uuid>
+amphora_role: STANDALONE
+amphora_compute_id: <nova-server-uuid>
+amphora_instance_name: instance-00123456
+amphora_compute_host: <nova-compute-host>
+amphora_hypervisor_hostname: <hypervisor-hostname>
+prometheus_libvirt_domains:
+  - instance-00123456
+prometheus_libvirt_domain_regex: instance-00123456
+```
+
+For ACTIVE_STANDBY, use the full `amphorae` list; it records both MASTER and BACKUP rather than assuming one VM.
+
+Each run preserves the same data in its collected `target.yml`, generated manifest, and `summary.json`. In addition, the persistent-LB setup directory preserves:
+
+```text
+results/<campaign-id>-<flavor>-campaign-lb/campaign-state.yml
+```
+
+That file survives final campaign cleanup, so after the Amphora has been deleted you can still recover the exact libvirt domain and historical time window:
+
+```bash
+jq '{
+  flavor: .octavia_flavor,
+  domain: .amphora_instance_name,
+  compute_id: .amphora_compute_id,
+  compute_host: .amphora_compute_host,
+  started: .load_test_started_at_utc,
+  completed: .load_test_completed_at_utc
+}' results/<run>/summary.json
+```
+
+Then use `amphora_instance_name` as the Prometheus `domain` label and set Grafana/Prometheus to the saved absolute UTC load window (optionally padded by about five minutes on each side).
+

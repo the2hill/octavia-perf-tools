@@ -20,12 +20,13 @@
         file: "{{ state_file }}"
         name: campaign_lb
 
-    - name: Set persistent load balancer child resource names
+    - name: Set persistent load balancer child resource names and primary Amphora
       ansible.builtin.set_fact:
         lb_name: "{{ campaign_lb.load_balancer_name }}"
         listener_name: "{{ campaign_lb.load_balancer_name }}-{{ scenario_slug }}-listener"
         pool_name: "{{ campaign_lb.load_balancer_name }}-{{ scenario_slug }}-pool"
         hm_name: "{{ campaign_lb.load_balancer_name }}-{{ scenario_slug }}-hm"
+        campaign_primary_amphora: "{{ campaign_lb.primary_amphora | default({}) }}"
 
     - name: Initialize per-run secret tracking
       ansible.builtin.copy:
@@ -254,6 +255,22 @@
           pool_id: {{ pool.pool.id | to_json }}
           provider: {{ campaign_lb.provider | default(None) | to_json }}
           flavor_id: {{ campaign_lb.flavor_id | default(None) | to_json }}
+          amphora_inventory_captured_at_utc: {{ campaign_lb.amphora_inventory_captured_at_utc | default(None) | to_json }}
+          amphora_count: {{ campaign_lb.amphora_count | default(0) | int | to_json }}
+          amphorae: {{ campaign_lb.amphorae | default([]) | to_json }}
+          primary_amphora: {{ campaign_lb.primary_amphora | default(None) | to_json }}
+          amphora_id: {{ campaign_primary_amphora.amphora_id | default(None) | to_json }}
+          amphora_role: {{ campaign_primary_amphora.role | default(None) | to_json }}
+          amphora_status: {{ campaign_primary_amphora.status | default(None) | to_json }}
+          amphora_compute_id: {{ campaign_primary_amphora.compute_id | default(None) | to_json }}
+          amphora_instance_name: {{ campaign_primary_amphora.instance_name | default(None) | to_json }}
+          amphora_compute_host: {{ campaign_primary_amphora.compute_host | default(None) | to_json }}
+          amphora_hypervisor_hostname: {{ campaign_primary_amphora.hypervisor_hostname | default(None) | to_json }}
+          amphora_availability_zone: {{ campaign_primary_amphora.availability_zone | default(None) | to_json }}
+          amphora_lb_network_ip: {{ campaign_primary_amphora.lb_network_ip | default(None) | to_json }}
+          amphora_vrrp_ip: {{ campaign_primary_amphora.vrrp_ip | default(None) | to_json }}
+          prometheus_libvirt_domains: {{ campaign_lb.prometheus_libvirt_domains | default([]) | to_json }}
+          prometheus_libvirt_domain_regex: {{ campaign_lb.prometheus_libvirt_domain_regex | default(None) | to_json }}
           vip_network_id: {{ campaign_lb.vip_network_id | default(None) | to_json }}
           vip_subnet_id: {{ campaign_lb.vip_subnet_id | default(None) | to_json }}
           target_host: {{ campaign_lb.target_host | to_json }}

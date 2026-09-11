@@ -402,3 +402,23 @@ The canonical baseline runbook runs one Octavia flavor at a time. Use `FLAVOR=<n
 
 Each suite gets a `suite_id` shared by its direct controls and Octavia runs. Direct controls carry `baseline_for_flavor` for provenance while remaining `target_kind=direct`. Persistent LB creation resolves the requested Octavia flavor to a UUID and verifies the created LB's `flavor_id` before benchmark traffic begins. Combined campaign reports keep legacy unscoped direct controls separate rather than assigning them to a flavor implicitly.
 
+### Amphora / Nova identity state
+
+Persistent-LB campaigns now capture the Amphora-to-Nova mapping immediately after the LB becomes ACTIVE. While a campaign is running, inspect `state/current_campaign_lbs.yml`; it contains one entry per active flavor and is safe for multi-flavor `benchmark.py --reuse-load-balancer` runs. Each flavor also keeps its normal `state/campaign_lb-<flavor>-<campaign-id>.yml` state file, enriched with the same identity data.
+
+For every Amphora the state records the Octavia Amphora ID/role/status, Nova `compute_id`, libvirt `instance_name`, compute host, hypervisor hostname, availability zone, management/VRRP addresses, image ID, and compute flavor ID. A `primary_amphora` convenience object selects `STANDALONE`, then `MASTER`, then the first Amphora. `prometheus_libvirt_domains` and `prometheus_libvirt_domain_regex` are included for historical libvirt queries.
+
+Every scenario's `state/current_target.yml` inherits this identity, and normal collection therefore preserves it in the result `target.yml`, `manifest.json`/`manifest.yml`, `RUN_MANIFEST.md`, and `summary.json`. The campaign-LB artifact directory also retains `campaign-state.yml`, so the Nova/libvirt identity is still available after final LB cleanup deletes the Amphora.
+
+Useful examples:
+
+```bash
+cat state/current_campaign_lbs.yml
+
+yq '.load_balancers[] | {flavor: .octavia_flavor, lb: .load_balancer_id, amphorae: .amphorae}' \
+  state/current_campaign_lbs.yml
+
+jq '{flavor: .octavia_flavor, compute_id: .amphora_compute_id, domain: .amphora_instance_name, host: .amphora_compute_host}' \
+  results/<run>/summary.json
+```
+
