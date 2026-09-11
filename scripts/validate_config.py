@@ -6,6 +6,7 @@ import pathlib
 import shutil
 import sys
 from typing import Any
+from urllib.parse import urlparse
 
 import yaml
 
@@ -341,6 +342,30 @@ def main() -> None:
         die("campaign.baseline_repetitions must be >= 0")
     if float(campaign.get("cooldown_seconds", 15)) < 0:
         die("campaign.cooldown_seconds must be >= 0")
+
+    grafana = cfg.get("grafana") or {}
+    if bool(grafana.get("enabled", False)):
+        grafana_url = str(grafana.get("url") or "").strip()
+        datasource_uid = str(grafana.get("prometheus_datasource_uid") or "").strip()
+        token_env = str(grafana.get("token_env") or "GRAFANA_TOKEN").strip()
+        if not grafana_url:
+            die("grafana.url is required when grafana.enabled=true")
+        parsed_grafana_url = urlparse(grafana_url)
+        if parsed_grafana_url.scheme not in {"http", "https"} or not parsed_grafana_url.netloc:
+            die("grafana.url must be an absolute http:// or https:// URL")
+        if not datasource_uid:
+            die("grafana.prometheus_datasource_uid is required when grafana.enabled=true")
+        if not token_env:
+            die("grafana.token_env must name the environment variable containing the service-account token")
+        if float(grafana.get("timeout_seconds", 30)) <= 0:
+            die("grafana.timeout_seconds must be > 0")
+        if int(grafana.get("step_seconds", 15)) <= 0:
+            die("grafana.step_seconds must be > 0")
+        if int(grafana.get("rate_window_seconds", 60)) <= 0:
+            die("grafana.rate_window_seconds must be > 0")
+        ca_file = grafana.get("ca_file")
+        if ca_file and not pathlib.Path(str(ca_file)).expanduser().exists():
+            die(f"grafana.ca_file does not exist: {ca_file}")
 
     print(
         f"configuration OK: {path}; traffic_path={traffic_path}; "

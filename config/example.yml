@@ -610,6 +610,20 @@ metrics:
   sample_interval_seconds: 1
   cpu_warn_percent: 85
 
+# Optional historical Amphora metrics collection through Grafana. Grafana remains
+# the only externally reachable endpoint; it proxies these requests to its internal
+# Prometheus/Thanos datasource. Keep the service-account token out of this file.
+grafana:
+  enabled: false
+  url: https://grafana.example.com
+  prometheus_datasource_uid: prometheus
+  token_env: GRAFANA_TOKEN
+  verify_tls: true
+  ca_file: null
+  timeout_seconds: 30
+  step_seconds: 15
+  rate_window_seconds: 60
+
 # Test these Octavia flavors serially. Use "default" to omit a flavor request and
 # measure the cloud's default. Replace/add names that exist in your environment.
 octavia:

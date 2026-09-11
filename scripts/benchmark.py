@@ -279,6 +279,15 @@ def one_run(
         (result_dir / "timing.yml").write_text(yaml.safe_dump(timing, sort_keys=False))
         stage = "collect"
         ansible("playbooks/collect.yml", config, **common)
+        stage = "grafana_prometheus_diagnostics"
+        run(
+            str(PYTHON),
+            "scripts/grafana_prometheus_diagnostics.py",
+            "--config",
+            str(config),
+            "--result-dir",
+            str(result_dir),
+        )
         stage = "manifest"
         run(str(PYTHON), "scripts/manifest.py", str(result_dir))
         stage = "report"

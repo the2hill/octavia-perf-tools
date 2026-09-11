@@ -366,6 +366,13 @@ def aggregate_octavia(selected: pd.DataFrame) -> pd.DataFrame:
         failure = pd.to_numeric(group["failure_percent_effective"], errors="coerce")
         requests = pd.to_numeric(group.get("requests", pd.Series(index=group.index, dtype=float)), errors="coerce")
         failures = pd.to_numeric(group.get("failures", pd.Series(index=group.index, dtype=float)), errors="coerce")
+        amphora_peak_cpu_cores = pd.to_numeric(group.get("amphora_peak_cpu_cores", pd.Series(index=group.index, dtype=float)), errors="coerce")
+        amphora_peak_cpu_percent = pd.to_numeric(group.get("amphora_peak_cpu_percent", pd.Series(index=group.index, dtype=float)), errors="coerce")
+        amphora_hottest_vcpu_percent = pd.to_numeric(group.get("amphora_hottest_vcpu_percent", pd.Series(index=group.index, dtype=float)), errors="coerce")
+        amphora_peak_tx_pps = pd.to_numeric(group.get("amphora_peak_tx_packets_per_second", pd.Series(index=group.index, dtype=float)), errors="coerce")
+        amphora_peak_rx_pps = pd.to_numeric(group.get("amphora_peak_rx_packets_per_second", pd.Series(index=group.index, dtype=float)), errors="coerce")
+        amphora_peak_vcpu_delay = pd.to_numeric(group.get("amphora_peak_vcpu_delay_seconds_per_second", pd.Series(index=group.index, dtype=float)), errors="coerce")
+        amphora_peak_vcpu_wait = pd.to_numeric(group.get("amphora_peak_vcpu_wait_seconds_per_second", pd.Series(index=group.index, dtype=float)), errors="coerce")
         med = primary.median()
         std = primary.std(ddof=1)
         cv = (std / med * 100.0) if pd.notna(std) and pd.notna(med) and med != 0 else math.nan
@@ -389,6 +396,13 @@ def aggregate_octavia(selected: pd.DataFrame) -> pd.DataFrame:
                 "min_p99_ms": p99.min(),
                 "max_p99_ms": p99.max(),
                 "median_failure_percent": failure.median(),
+                "median_amphora_peak_cpu_cores": amphora_peak_cpu_cores.median(),
+                "median_amphora_peak_cpu_percent": amphora_peak_cpu_percent.median(),
+                "median_amphora_hottest_vcpu_percent": amphora_hottest_vcpu_percent.median(),
+                "median_amphora_peak_tx_pps": amphora_peak_tx_pps.median(),
+                "median_amphora_peak_rx_pps": amphora_peak_rx_pps.median(),
+                "median_amphora_peak_vcpu_delay": amphora_peak_vcpu_delay.median(),
+                "median_amphora_peak_vcpu_wait": amphora_peak_vcpu_wait.median(),
                 "total_requests": requests.sum(min_count=1),
                 "total_failures": failures.sum(min_count=1),
                 "fingerprint_count": len(fps),
@@ -671,6 +685,14 @@ See [`DETAILED_COMPARISON.md`](DETAILED_COMPARISON.md) for actual metric values,
         )
         if reference_flavor:
             display.insert(7, f"vs {reference_flavor}", group["delta_vs_reference_percent"].map(fmt_pct))
+        if group["median_amphora_peak_cpu_cores"].notna().any():
+            display["Amph peak cores"] = group["median_amphora_peak_cpu_cores"].map(lambda x: fmt(x, 2))
+        if group["median_amphora_hottest_vcpu_percent"].notna().any():
+            display["Hot vCPU %"] = group["median_amphora_hottest_vcpu_percent"].map(lambda x: fmt_pct(x, 1))
+        if group["median_amphora_peak_tx_pps"].notna().any():
+            display["Peak TX pps"] = group["median_amphora_peak_tx_pps"].map(fmt)
+        if group["median_amphora_peak_vcpu_delay"].notna().any():
+            display["vCPU delay s/s"] = group["median_amphora_peak_vcpu_delay"].map(lambda x: fmt(x, 6))
         detail_lines.append(md_table(display, list(display.columns)))
 
         if not direct_summary.empty:

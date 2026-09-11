@@ -83,6 +83,7 @@ def harness_hash(repo_root: Path) -> str:
         "playbooks/prepare_tls.yml",
         "scripts/benchmark.py",
         "scripts/amphora_inventory.py",
+        "scripts/grafana_prometheus_diagnostics.py",
         "scripts/topology.py",
         "scripts/controller_fip_route.py",
         "playbooks/provision.yml",
@@ -344,6 +345,14 @@ def build_manifest(result_dir: Path) -> dict[str, Any]:
     timing = load_yaml(result_dir / "timing.yml")
     tls_material_path = result_dir / "tls-material.json"
     tls_material = json.loads(tls_material_path.read_text()) if tls_material_path.exists() else {}
+    prometheus_diag_path = result_dir / "prometheus-diagnostics.json"
+    if prometheus_diag_path.exists():
+        try:
+            prometheus_diag = json.loads(prometheus_diag_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            prometheus_diag = {"status": "unreadable"}
+    else:
+        prometheus_diag = {"status": "missing"}
     nodes = []
     for path in sorted((result_dir / "node-specs").glob("*.yml")):
         value = load_yaml(path)
@@ -397,7 +406,7 @@ def build_manifest(result_dir: Path) -> dict[str, Any]:
     }
 
     manifest: dict[str, Any] = {
-        "schema_version": 6,
+        "schema_version": 7,
         "benchmark_id": target.get("benchmark_id") or result_dir.name,
         "captured_at_utc": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat(),
         "timing": timing,
@@ -406,6 +415,20 @@ def build_manifest(result_dir: Path) -> dict[str, Any]:
         "target": target,
         "scenario": scenario,
         "cloud": cfg.get("openstack") or {},
+        "observability": {
+            "grafana": cfg.get("grafana") or {},
+            "prometheus_diagnostics": {
+                "status": prometheus_diag.get("status"),
+                "collector": prometheus_diag.get("collector"),
+                "query_window": prometheus_diag.get("query_window"),
+                "domains": prometheus_diag.get("domains"),
+                "successful_queries": prometheus_diag.get("successful_queries"),
+                "failed_queries": prometheus_diag.get("failed_queries"),
+                "summary": prometheus_diag.get("summary") or {},
+                "error": prometheus_diag.get("error"),
+                "query_errors": prometheus_diag.get("query_errors") or {},
+            },
+        },
         "network": network_manifest,
         "generator_network": {
             "configured": generator_network_cfg,

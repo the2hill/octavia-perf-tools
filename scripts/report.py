@@ -83,6 +83,8 @@ def base_summary(target: dict, manifest: dict) -> dict:
     cloud_spec = manifest.get("cloud") or {}
     octavia_spec = manifest.get("octavia") or {}
     workload_spec = manifest.get("workload") or {}
+    prometheus_diag = ((manifest.get("observability") or {}).get("prometheus_diagnostics") or {})
+    prometheus_summary = prometheus_diag.get("summary") or {}
     return {
         "benchmark_id": target.get("benchmark_id"),
         "suite_id": target.get("suite_id") or target.get("campaign_id"),
@@ -129,6 +131,21 @@ def base_summary(target: dict, manifest: dict) -> dict:
         "amphora_vrrp_ip": target.get("amphora_vrrp_ip"),
         "prometheus_libvirt_domains": target.get("prometheus_libvirt_domains") or [],
         "prometheus_libvirt_domain_regex": target.get("prometheus_libvirt_domain_regex"),
+        "prometheus_diagnostics_status": prometheus_diag.get("status"),
+        "amphora_avg_cpu_cores": prometheus_summary.get("avg_cpu_cores"),
+        "amphora_peak_cpu_cores": prometheus_summary.get("peak_cpu_cores"),
+        "amphora_avg_cpu_percent": prometheus_summary.get("avg_cpu_percent"),
+        "amphora_peak_cpu_percent": prometheus_summary.get("peak_cpu_percent"),
+        "amphora_allocated_vcpus": prometheus_summary.get("allocated_vcpus"),
+        "amphora_hottest_vcpu_percent": prometheus_summary.get("hottest_vcpu_percent"),
+        "amphora_peak_vcpu_delay_seconds_per_second": prometheus_summary.get("peak_vcpu_delay_seconds_per_second"),
+        "amphora_peak_vcpu_wait_seconds_per_second": prometheus_summary.get("peak_vcpu_wait_seconds_per_second"),
+        "amphora_peak_rx_bytes_per_second": prometheus_summary.get("peak_rx_bytes_per_second"),
+        "amphora_peak_tx_bytes_per_second": prometheus_summary.get("peak_tx_bytes_per_second"),
+        "amphora_peak_rx_packets_per_second": prometheus_summary.get("peak_rx_packets_per_second"),
+        "amphora_peak_tx_packets_per_second": prometheus_summary.get("peak_tx_packets_per_second"),
+        "amphora_peak_rx_errors_per_second": prometheus_summary.get("peak_rx_errors_per_second"),
+        "amphora_peak_tx_errors_per_second": prometheus_summary.get("peak_tx_errors_per_second"),
         "campaign_label": (manifest.get("metadata") or {}).get("campaign_label"),
         "cloud_build": (manifest.get("metadata") or {}).get("cloud_build"),
         "load_test_started_at_utc": (manifest.get("timing") or {}).get("load_test_started_at_utc"),
@@ -487,6 +504,15 @@ def write_markdown(root: Path, summary: dict) -> None:
 - Generator validity warnings: **{'; '.join(summary.get('validity_warnings') or []) or 'None.'}**
 - Comparison fingerprint: **`{summary.get('spec_fingerprint') or 'n/a'}`**
 
+## Amphora Prometheus diagnostics
+
+- Collection status: **`{summary.get('prometheus_diagnostics_status') or 'not collected'}`**
+- CPU: avg **{summary.get('amphora_avg_cpu_cores') if summary.get('amphora_avg_cpu_cores') is not None else 'n/a'}** cores; peak **{summary.get('amphora_peak_cpu_cores') if summary.get('amphora_peak_cpu_cores') is not None else 'n/a'}** cores; hottest vCPU **{summary.get('amphora_hottest_vcpu_percent') if summary.get('amphora_hottest_vcpu_percent') is not None else 'n/a'}%**
+- Network: peak RX/TX **{summary.get('amphora_peak_rx_packets_per_second') if summary.get('amphora_peak_rx_packets_per_second') is not None else 'n/a'} / {summary.get('amphora_peak_tx_packets_per_second') if summary.get('amphora_peak_tx_packets_per_second') is not None else 'n/a'} pps**
+- Scheduler: peak vCPU delay/wait **{summary.get('amphora_peak_vcpu_delay_seconds_per_second') if summary.get('amphora_peak_vcpu_delay_seconds_per_second') is not None else 'n/a'} / {summary.get('amphora_peak_vcpu_wait_seconds_per_second') if summary.get('amphora_peak_vcpu_wait_seconds_per_second') is not None else 'n/a'} s/s**
+
+Full raw query results are in `prometheus-diagnostics.json`.
+
 ## Run specification
 
 The complete generator/backend/OpenStack/TLS/socket-limit snapshot is in [`RUN_MANIFEST.md`](RUN_MANIFEST.md). The aggregated per-level connection data is in `connection-capacity-summary.csv`.
@@ -549,6 +575,15 @@ The complete generator/backend/OpenStack/TLS/socket-limit snapshot is in [`RUN_M
 - Client/backend CPU warnings: **{warning_text}**
 - Search validity warnings: **{'; '.join(summary.get('validity_warnings') or []) or 'None.'}**
 - Comparison fingerprint: **`{summary.get('spec_fingerprint') or 'n/a'}`**
+
+## Amphora Prometheus diagnostics
+
+- Collection status: **`{summary.get('prometheus_diagnostics_status') or 'not collected'}`**
+- CPU: avg **{summary.get('amphora_avg_cpu_cores') if summary.get('amphora_avg_cpu_cores') is not None else 'n/a'}** cores; peak **{summary.get('amphora_peak_cpu_cores') if summary.get('amphora_peak_cpu_cores') is not None else 'n/a'}** cores; hottest vCPU **{summary.get('amphora_hottest_vcpu_percent') if summary.get('amphora_hottest_vcpu_percent') is not None else 'n/a'}%**
+- Network: peak RX/TX **{summary.get('amphora_peak_rx_packets_per_second') if summary.get('amphora_peak_rx_packets_per_second') is not None else 'n/a'} / {summary.get('amphora_peak_tx_packets_per_second') if summary.get('amphora_peak_tx_packets_per_second') is not None else 'n/a'} pps**
+- Scheduler: peak vCPU delay/wait **{summary.get('amphora_peak_vcpu_delay_seconds_per_second') if summary.get('amphora_peak_vcpu_delay_seconds_per_second') is not None else 'n/a'} / {summary.get('amphora_peak_vcpu_wait_seconds_per_second') if summary.get('amphora_peak_vcpu_wait_seconds_per_second') is not None else 'n/a'} s/s**
+
+Full raw query results are in `prometheus-diagnostics.json`.
 
 ## Run specification
 
