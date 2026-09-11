@@ -165,7 +165,7 @@ Optional listener/pool TLS versions and ciphers can be configured under `tls:`. 
 - Python 3.10+
 - `ssh-keygen`
 - `openssl`
-- An OpenStack `clouds.yaml` profile with Nova, Neutron, Octavia, and (for TLS termination/re-encryption) Barbican/key-manager permissions
+- A tenant OpenStack `clouds.yaml` profile with Nova, Neutron, Octavia, and (for TLS termination/re-encryption) Barbican/key-manager permissions, plus a separate admin/operator profile for Octavia Amphora inventory and backing Nova/Neutron metadata
 - A routable external network for the Locust master floating IP and SNAT
 - An Ubuntu-like image with cloud-init and Python; Ubuntu 24.04 is the recommended baseline
 - Enough quotas for 1 master + configured workers + configured backends, ports, security groups, floating IPs, load balancers, temporary Barbican secrets, and (for dedicated generator modes) an additional network/subnet/router
@@ -174,15 +174,24 @@ Optional listener/pool TLS versions and ciphers can be configured under `tls:`. 
 
 ## OpenStack authentication
 
-Prefer `~/.config/openstack/clouds.yaml` and reference only the profile name in `config/local.yml`. You can also use normal `OS_*` environment variables supported by openstacksdk/Ansible. Do not put usernames, passwords, application credentials, or tokens in this repository.
+Prefer `~/.config/openstack/clouds.yaml` and reference only profile names in `config/local.yml`. Keep the benchmark tenant and operator credentials separate:
 
-For SJC3, start with your existing working cloud profile rather than embedding credentials here. Endpoint and credential details therefore remain outside the Git repository.
+```yaml
+openstack:
+  cloud: sjc3
+  admin_cloud: sjc3-admin
+  region_name: SJC3
+```
+
+`openstack.cloud` is used for normal provisioning and benchmark operations. `openstack.admin_cloud` is used only by Amphora inventory/failure diagnostics to call the admin-only Octavia Amphora API and inspect the backing Nova/Neutron resources. The admin profile should have the operator permissions required for those reads; do not grant those permissions to the benchmark tenant profile. Credentials themselves remain in `clouds.yaml`, not this repository.
+
+For SJC3, start with your existing working tenant and admin cloud profiles rather than embedding credentials here. Endpoint and credential details therefore remain outside the Git repository.
 
 ## Quick start
 
 ```bash
 cp config/example.yml config/local.yml
-# edit cloud/environment label, image, external network, operator_cidr, and Octavia flavor names
+# edit cloud/admin_cloud, environment label, image, external network, operator_cidr, and Octavia flavor names
 make bootstrap
 make validate CONFIG=config/local.yml
 make provision CONFIG=config/local.yml
@@ -405,6 +414,8 @@ Each suite gets a `suite_id` shared by its direct controls and Octavia runs. Dir
 ### Amphora / Nova identity state
 
 Persistent-LB campaigns now capture the Amphora-to-Nova mapping immediately after the LB becomes ACTIVE. While a campaign is running, inspect `state/current_campaign_lbs.yml`; it contains one entry per active flavor and is safe for multi-flavor `benchmark.py --reuse-load-balancer` runs. Each flavor also keeps its normal `state/campaign_lb-<flavor>-<campaign-id>.yml` state file, enriched with the same identity data.
+
+This capture uses `openstack.admin_cloud`, not the tenant `openstack.cloud`, because Octavia's Amphora inventory endpoint is admin-only and the backing Nova/Neutron metadata requires operator visibility.
 
 For every Amphora the state records the Octavia Amphora ID/role/status, Nova `compute_id`, libvirt `instance_name`, compute host, hypervisor hostname, availability zone, management/VRRP addresses, image ID, and compute flavor ID. A `primary_amphora` convenience object selects `STANDALONE`, then `MASTER`, then the first Amphora. `prometheus_libvirt_domains` and `prometheus_libvirt_domain_regex` are included for historical libvirt queries.
 

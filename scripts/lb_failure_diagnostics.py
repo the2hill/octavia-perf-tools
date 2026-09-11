@@ -68,22 +68,30 @@ def main() -> None:
     args = ap.parse_args()
 
     cfg = yaml.safe_load(pathlib.Path(args.config).read_text()) or {}
-    cloud = str((cfg.get("openstack") or {}).get("cloud") or "")
-    region = str((cfg.get("openstack") or {}).get("region_name") or "") or None
+    cloud_cfg = cfg.get("openstack") or {}
+    cloud = str(cloud_cfg.get("cloud") or "")
+    admin_cloud = str(cloud_cfg.get("admin_cloud") or "")
+    region = str(cloud_cfg.get("region_name") or "") or None
     if not cloud:
         raise SystemExit("openstack.cloud is required in the benchmark config")
+    if not admin_cloud:
+        raise SystemExit(
+            "openstack.admin_cloud is required for Amphora/Nova diagnostics"
+        )
 
     out: dict[str, Any] = {
         "captured_at_utc": dt.datetime.now(dt.timezone.utc)
         .replace(microsecond=0)
         .isoformat(),
         "cloud": cloud,
+        "admin_cloud": admin_cloud,
         "region": region,
         "requested_load_balancer": args.load_balancer,
         "errors": {},
     }
 
     conn = connect(cloud, region)
+    admin_conn = connect(admin_cloud, region)
 
     try:
         lb = conn.load_balancer.find_load_balancer(args.load_balancer, ignore_missing=True)
@@ -120,7 +128,7 @@ def main() -> None:
 
         amphorae: list[Any] = []
         try:
-            amphorae = list(conn.load_balancer.amphorae(loadbalancer_id=lb.id))
+            amphorae = list(admin_conn.load_balancer.amphorae(loadbalancer_id=lb.id))
             out["amphorae"] = [as_dict(x) for x in amphorae]
         except Exception as exc:
             record_error(out, "amphorae", exc)
@@ -145,10 +153,10 @@ def main() -> None:
                 "compute_id": compute_id,
             }
             try:
-                server = conn.compute.get_server(compute_id)
+                server = admin_conn.compute.get_server(compute_id)
                 item["server"] = as_dict(server)
                 try:
-                    console = conn.compute.get_server_console_output(server, length=120)
+                    console = admin_conn.compute.get_server_console_output(server, length=120)
                     item["console_tail"] = as_dict(console)
                 except Exception as exc:
                     item["console_error"] = {
@@ -166,7 +174,7 @@ def main() -> None:
         ports: list[dict[str, Any]] = []
         for port_id in sorted(neutron_port_ids):
             try:
-                ports.append(as_dict(conn.network.get_port(port_id)))
+                ports.append(as_dict(admin_conn.network.get_port(port_id)))
             except Exception as exc:
                 ports.append(
                     {

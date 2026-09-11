@@ -37,6 +37,7 @@ def main() -> None:
 
     for dotted in (
         "openstack.cloud",
+        "openstack.admin_cloud",
         "network.name",
         "network.subnet_name",
         "network.cidr",

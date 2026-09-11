@@ -10,8 +10,12 @@ metadata:
   notes: null
 
 openstack:
-  # Name of a cloud in ~/.config/openstack/clouds.yaml (preferred) or OS_CLOUD.
+  # Tenant/project cloud used for provisioning and benchmark operations.
   cloud: sjc3
+  # Separate operator/admin clouds.yaml profile used only to capture Octavia
+  # Amphora inventory and the backing Nova/Neutron details. Do not grant these
+  # permissions to the benchmark tenant profile.
+  admin_cloud: sjc3-admin
   region_name: SJC3
   # Free-form label recorded in every run manifest; it is documentation only.
   environment_label: api.sjc3.rackspacecloud.com

@@ -45,11 +45,16 @@ def connect_from_config(config_path: pathlib.Path):
 
     cfg = load_yaml(config_path)
     cloud_cfg = cfg.get("openstack") or {}
-    cloud = cloud_cfg.get("cloud")
-    if not cloud:
-        raise SystemExit("openstack.cloud is required in the benchmark config")
+    admin_cloud = cloud_cfg.get("admin_cloud")
+    if not admin_cloud:
+        raise SystemExit(
+            "openstack.admin_cloud is required for Amphora/Nova inventory capture"
+        )
 
-    kwargs: dict[str, Any] = {"cloud": cloud}
+    # Amphora inventory is admin-only in Octavia, and the associated Nova
+    # server/host metadata also requires operator visibility. Keep this separate
+    # from openstack.cloud so benchmark provisioning still uses tenant credentials.
+    kwargs: dict[str, Any] = {"cloud": admin_cloud}
     region = cloud_cfg.get("region_name")
     if region:
         kwargs["region_name"] = region

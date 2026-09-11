@@ -9,13 +9,14 @@ cp config/example.yml config/local.yml
 At minimum set:
 
 - `openstack.cloud`
+- `openstack.admin_cloud`
 - `openstack.region_name`
 - `network.external_network`
 - `ssh.operator_cidr`
 - `vm.image`
 - `octavia.flavors`
 
-Credentials stay in `clouds.yaml` or normal OpenStack environment variables.
+Credentials stay in `clouds.yaml`. `openstack.cloud` is the tenant benchmark profile; `openstack.admin_cloud` is a separate operator profile used only for Amphora/Nova/Neutron inventory and failure diagnostics.
 
 ## 2. Bootstrap and validate
 
@@ -622,7 +623,7 @@ For combined reports, new direct controls are associated with their matching `ba
 
 ## Amphora identity and historical Prometheus correlation
 
-Persistent-LB creation captures Amphora and Nova identity before benchmark traffic starts. During a live campaign use:
+Persistent-LB creation captures Amphora and Nova identity before benchmark traffic starts. The capture uses `openstack.admin_cloud` because the Octavia Amphora inventory API is admin-only; normal LB provisioning and test operations continue to use the tenant `openstack.cloud`. During a live campaign use:
 
 ```bash
 cat state/current_campaign_lbs.yml
