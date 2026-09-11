@@ -110,8 +110,8 @@
 
     - name: Create scenario listener on persistent load balancer
       openstack.cloud.lb_listener:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ listener_name }}"
         load_balancer: "{{ lb_name }}"
         protocol: "{{ scenario.listener_protocol }}"
@@ -154,8 +154,8 @@
 
     - name: Create scenario pool
       openstack.cloud.lb_pool:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ pool_name }}"
         listener: "{{ listener_name }}"
         protocol: "{{ scenario.pool_protocol }}"
@@ -190,8 +190,8 @@
 
     - name: Add backend members
       openstack.cloud.lb_member:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ item }}"
         pool: "{{ pool_name }}"
         address: "{{ hostvars[item].private_ip }}"
@@ -204,8 +204,8 @@
 
     - name: Create health monitor
       openstack.cloud.lb_health_monitor:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ hm_name }}"
         pool: "{{ pool_name }}"
         type: "{{ scenario.health_monitor_type }}"

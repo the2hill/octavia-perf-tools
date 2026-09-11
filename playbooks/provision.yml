@@ -30,24 +30,24 @@
 
     - name: Upload SSH keypair
       openstack.cloud.keypair:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ ssh.keypair_name }}"
         public_key_file: "{{ ssh_public_key_abs }}"
         state: present
 
     - name: Create benchmark network
       openstack.cloud.network:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ network.name }}"
         state: present
       when: network.create | bool
 
     - name: Create benchmark subnet
       openstack.cloud.subnet:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ network.subnet_name }}"
         network_name: "{{ network.name }}"
         cidr: "{{ network.cidr }}"
@@ -58,8 +58,8 @@
 
     - name: Create benchmark router
       openstack.cloud.router:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ network.router_name }}"
         network: "{{ network.external_network }}"
         interfaces:
@@ -69,8 +69,8 @@
 
     - name: Create dedicated generator network
       openstack.cloud.network:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ generator_network.name }}"
         state: present
       when:
@@ -79,8 +79,8 @@
 
     - name: Create dedicated generator subnet
       openstack.cloud.subnet:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ generator_network.subnet_name }}"
         network_name: "{{ generator_network.name }}"
         cidr: "{{ generator_network.cidr }}"
@@ -93,8 +93,8 @@
 
     - name: Route dedicated generator subnet to tenant VIP network
       openstack.cloud.router:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ network.router_name }}"
         network: "{{ network.external_network }}"
         interfaces:
@@ -107,8 +107,8 @@
 
     - name: Create external-only generator router
       openstack.cloud.router:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ generator_network.router_name }}"
         network: "{{ network.external_network }}"
         interfaces:
@@ -120,16 +120,16 @@
 
     - name: Create benchmark security group
       openstack.cloud.security_group:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ run_prefix }}-sg"
         description: Octavia performance benchmark nodes
         state: present
 
     - name: Allow SSH to jump host from operator CIDR
       openstack.cloud.security_group_rule:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         security_group: "{{ run_prefix }}-sg"
         protocol: tcp
         port_range_min: 22
@@ -140,8 +140,8 @@
 
     - name: Allow benchmark-network node-to-node TCP
       openstack.cloud.security_group_rule:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         security_group: "{{ run_prefix }}-sg"
         protocol: tcp
         remote_ip_prefix: "{{ network.cidr }}"
@@ -150,8 +150,8 @@
 
     - name: Allow dedicated generator-network TCP
       openstack.cloud.security_group_rule:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         security_group: "{{ run_prefix }}-sg"
         protocol: tcp
         remote_ip_prefix: "{{ generator_network.cidr }}"
@@ -161,8 +161,8 @@
 
     - name: Allow Locust web UI from operator CIDR
       openstack.cloud.security_group_rule:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         security_group: "{{ run_prefix }}-sg"
         protocol: tcp
         port_range_min: 8089
@@ -173,8 +173,8 @@
 
     - name: Query master flavor candidates
       openstack.cloud.compute_flavor_info:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         ram: ">={{ vm.master.min_ram_mb }}"
         vcpus: ">={{ vm.master.min_vcpus }}"
       when: vm.master.flavor == 'auto'
@@ -182,8 +182,8 @@
 
     - name: Query Locust flavor candidates
       openstack.cloud.compute_flavor_info:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         ram: ">={{ vm.locust.min_ram_mb }}"
         vcpus: ">={{ vm.locust.min_vcpus }}"
       when: vm.locust.flavor == 'auto'
@@ -191,8 +191,8 @@
 
     - name: Query backend flavor candidates
       openstack.cloud.compute_flavor_info:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         ram: ">={{ vm.backend.min_ram_mb }}"
         vcpus: ">={{ vm.backend.min_vcpus }}"
       when: vm.backend.flavor == 'auto'
@@ -206,8 +206,8 @@
 
     - name: Query flavor catalog for resolved metadata
       openstack.cloud.compute_flavor_info:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
       register: all_flavors_query
 
     - name: Resolve selected flavor metadata by name or ID
@@ -218,16 +218,16 @@
 
     - name: Query benchmark image metadata
       openstack.cloud.image_info:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         image: "{{ vm.image }}"
       register: benchmark_image_query
       failed_when: false
 
     - name: Create backend soft anti-affinity group
       openstack.cloud.server_group:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ run_prefix }}-backend-aa"
         policy: soft-anti-affinity
         state: present
@@ -235,8 +235,8 @@
 
     - name: Create Locust soft anti-affinity group
       openstack.cloud.server_group:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ run_prefix }}-locust-aa"
         policy: soft-anti-affinity
         state: present
@@ -244,8 +244,8 @@
 
     - name: Create Locust master on shared benchmark network
       openstack.cloud.server:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ run_prefix }}-master"
         image: "{{ vm.image }}"
         flavor: "{{ selected_master_flavor }}"
@@ -263,8 +263,8 @@
 
     - name: Create dual-homed Locust master for dedicated generator network
       openstack.cloud.server:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ run_prefix }}-master"
         image: "{{ vm.image }}"
         flavor: "{{ selected_master_flavor }}"
@@ -293,8 +293,8 @@
 
     - name: Attach floating IP to Locust master
       openstack.cloud.floating_ip:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         server: "{{ run_prefix }}-master"
         network: "{{ network.external_network }}"
         nat_destination: "{{ network.name }}"
@@ -310,8 +310,8 @@
 
     - name: Query external network MTU for controller FIP path
       openstack.cloud.networks_info:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ network.external_network }}"
       register: controller_external_network
 
@@ -355,8 +355,8 @@
 
     - name: Create backend servers
       openstack.cloud.server:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ run_prefix }}-backend-{{ '%02d' | format(item) }}"
         image: "{{ vm.image }}"
         flavor: "{{ selected_backend_flavor }}"
@@ -376,8 +376,8 @@
 
     - name: Create Locust worker servers
       openstack.cloud.server:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ run_prefix }}-locust-{{ '%02d' | format(item) }}"
         image: "{{ vm.image }}"
         flavor: "{{ selected_locust_flavor }}"

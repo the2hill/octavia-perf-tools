@@ -15,8 +15,8 @@
   tasks:
     - name: Delete known load balancers for every flavor/scenario combination
       openstack.cloud.loadbalancer:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ run_prefix }}-{{ item.0 | regex_replace('[^A-Za-z0-9_.-]', '-') }}-{{ item.1 | regex_replace('[^A-Za-z0-9_.-]', '-') }}"
         delete_floating_ip: "{{ use_fip | bool }}"
         state: absent
@@ -57,8 +57,8 @@
 
     - name: Delete Locust workers
       openstack.cloud.server:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ run_prefix }}-locust-{{ '%02d' | format(item) }}"
         state: absent
         wait: true
@@ -67,8 +67,8 @@
 
     - name: Delete backend servers
       openstack.cloud.server:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ run_prefix }}-backend-{{ '%02d' | format(item) }}"
         state: absent
         wait: true
@@ -77,8 +77,8 @@
 
     - name: Delete Locust master and its floating IP
       openstack.cloud.server:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ run_prefix }}-master"
         delete_ips: true
         state: absent
@@ -87,8 +87,8 @@
 
     - name: Delete server groups
       openstack.cloud.server_group:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ item }}"
         state: absent
       loop:
@@ -97,15 +97,15 @@
 
     - name: Delete security group
       openstack.cloud.security_group:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ run_prefix }}-sg"
         state: absent
 
     - name: Delete external-only generator router
       openstack.cloud.router:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ generator_network.router_name }}"
         state: absent
       when:
@@ -114,8 +114,8 @@
 
     - name: Remove dedicated-routed generator interface from benchmark router
       openstack.cloud.router:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ network.router_name }}"
         network: "{{ network.external_network }}"
         interfaces:
@@ -128,8 +128,8 @@
 
     - name: Delete dedicated generator subnet
       openstack.cloud.subnet:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ generator_network.subnet_name }}"
         state: absent
       when:
@@ -138,8 +138,8 @@
 
     - name: Delete dedicated generator network
       openstack.cloud.network:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ generator_network.name }}"
         state: absent
       when:
@@ -148,31 +148,31 @@
 
     - name: Delete router
       openstack.cloud.router:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ network.router_name }}"
         state: absent
       when: network.create | bool
 
     - name: Delete subnet
       openstack.cloud.subnet:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ network.subnet_name }}"
         state: absent
       when: network.create | bool
 
     - name: Delete network
       openstack.cloud.network:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ network.name }}"
         state: absent
       when: network.create | bool
 
     - name: Delete uploaded keypair
       openstack.cloud.keypair:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ ssh.keypair_name }}"
         state: absent

@@ -64,8 +64,8 @@
 
     - name: Delete scenario health monitor
       openstack.cloud.lb_health_monitor:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ hm_name }}"
         pool: "{{ pool_name }}"
         state: absent
@@ -75,8 +75,8 @@
 
     - name: Delete scenario backend members
       openstack.cloud.lb_member:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ item }}"
         pool: "{{ pool_name }}"
         state: absent
@@ -87,8 +87,8 @@
 
     - name: Delete scenario pool
       openstack.cloud.lb_pool:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ pool_name }}"
         listener: "{{ listener_name }}"
         state: absent
@@ -98,8 +98,8 @@
 
     - name: Delete scenario listener
       openstack.cloud.lb_listener:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ listener_name }}"
         load_balancer: "{{ campaign_lb.load_balancer_name }}"
         state: absent
@@ -109,8 +109,8 @@
 
     - name: Retry scenario pool deletion after listener removal
       openstack.cloud.lb_pool:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ pool_name }}"
         listener: "{{ listener_name }}"
         state: absent
@@ -120,8 +120,8 @@
 
     - name: Retry scenario listener deletion after pool removal
       openstack.cloud.lb_listener:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ listener_name }}"
         load_balancer: "{{ campaign_lb.load_balancer_name }}"
         state: absent

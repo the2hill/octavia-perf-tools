@@ -30,8 +30,8 @@
 
     - name: Delete persistent campaign load balancer and all remaining children
       openstack.cloud.loadbalancer:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ campaign_lb_name_effective }}"
         delete_floating_ip: "{{ use_fip | bool }}"
         state: absent

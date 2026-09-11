@@ -12,8 +12,8 @@
   tasks:
     - name: Create persistent campaign load balancer
       openstack.cloud.loadbalancer:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ lb_name }}"
         vip_subnet: "{{ network.subnet_name }}"
         flavor: "{{ requested_flavor_id if requested_flavor_id | length > 0 else omit }}"

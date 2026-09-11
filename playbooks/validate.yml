@@ -21,14 +21,14 @@
   tasks:
     - name: Authenticate to cloud
       openstack.cloud.auth:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
-        validate_certs: "{{ openstack.validate_certs | default(true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
+        validate_certs: "{{ (openstack.validate_certs | default(true)) if (openstack.cloud is string) else omit }}"
 
     - name: Check external network
       openstack.cloud.networks_info:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ network.external_network }}"
       register: ext_net
 
@@ -39,8 +39,8 @@
 
     - name: Check pre-existing dedicated generator network
       openstack.cloud.networks_info:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         name: "{{ generator_network.name }}"
       register: existing_generator_net
       when:
@@ -71,8 +71,8 @@
 
     - name: Query candidate master flavors
       openstack.cloud.compute_flavor_info:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         ram: ">={{ vm.master.min_ram_mb }}"
         vcpus: ">={{ vm.master.min_vcpus }}"
       when: vm.master.flavor == 'auto'
@@ -80,8 +80,8 @@
 
     - name: Query candidate Locust flavors
       openstack.cloud.compute_flavor_info:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         ram: ">={{ vm.locust.min_ram_mb }}"
         vcpus: ">={{ vm.locust.min_vcpus }}"
       when: vm.locust.flavor == 'auto'
@@ -89,8 +89,8 @@
 
     - name: Query candidate backend flavors
       openstack.cloud.compute_flavor_info:
-        cloud: "{{ openstack.cloud }}"
-        region_name: "{{ openstack.region_name | default(omit, true) }}"
+        cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
+        region_name: "{{ (openstack.region_name | default(omit, true)) if (openstack.cloud is string) else omit }}"
         ram: ">={{ vm.backend.min_ram_mb }}"
         vcpus: ">={{ vm.backend.min_vcpus }}"
       when: vm.backend.flavor == 'auto'
