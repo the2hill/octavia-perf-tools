@@ -5,14 +5,8 @@ import argparse
 import json
 import time
 
-import openstack
+from openstack_auth import connect
 
-
-def connect(cloud: str, region: str | None):
-    kwargs = {"cloud": cloud}
-    if region:
-        kwargs["region_name"] = region
-    return openstack.connect(**kwargs)
 
 
 def wait_pool(conn, pool_id: str, timeout: int) -> object:

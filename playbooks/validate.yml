@@ -62,9 +62,10 @@
           - "{{ root_dir }}/scripts/barbican_secret.py"
           - probe
           - --cloud
-          - "{{ openstack.cloud }}"
+          - "{{ openstack.cloud | to_json }}"
           - --region
           - "{{ openstack.region_name | default('') }}"
+      no_log: true
       changed_when: false
       when: barbican_required | bool
 

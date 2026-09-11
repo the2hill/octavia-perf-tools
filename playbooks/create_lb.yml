@@ -39,7 +39,7 @@
           - "{{ root_dir }}/scripts/barbican_secret.py"
           - create
           - --cloud
-          - "{{ openstack.cloud }}"
+          - "{{ openstack.cloud | to_json }}"
           - --region
           - "{{ openstack.region_name | default('') }}"
           - --name
@@ -48,6 +48,7 @@
           - "{{ root_dir }}/state/tls/frontend.p12"
           - --content-type
           - application/octet-stream
+      no_log: true
       register: frontend_secret_cmd
       when: scenario.frontend_tls_termination | default(false) | bool
       changed_when: true
@@ -73,7 +74,7 @@
           - "{{ root_dir }}/scripts/barbican_secret.py"
           - create
           - --cloud
-          - "{{ openstack.cloud }}"
+          - "{{ openstack.cloud | to_json }}"
           - --region
           - "{{ openstack.region_name | default('') }}"
           - --name
@@ -82,6 +83,7 @@
           - "{{ root_dir }}/state/tls/ca.crt"
           - --content-type
           - application/octet-stream
+      no_log: true
       register: backend_ca_secret_cmd
       when: scenario.backend_reencrypt | default(false) | bool
       changed_when: true
@@ -124,7 +126,7 @@
           - "{{ root_dir }}/scripts/octavia_tls.py"
           - listener
           - --cloud
-          - "{{ openstack.cloud }}"
+          - "{{ openstack.cloud | to_json }}"
           - --region
           - "{{ openstack.region_name | default('') }}"
           - --listener-id
@@ -139,6 +141,7 @@
           - "{{ octavia.listener.timeout_client_data_ms | default(300000) }}"
           - --timeout-member-data
           - "{{ octavia.listener.timeout_member_data_ms | default(300000) }}"
+      no_log: true
       register: listener_tuning_cmd
       changed_when: true
 
@@ -166,7 +169,7 @@
           - "{{ root_dir }}/scripts/octavia_tls.py"
           - pool
           - --cloud
-          - "{{ openstack.cloud }}"
+          - "{{ openstack.cloud | to_json }}"
           - --region
           - "{{ openstack.region_name | default('') }}"
           - --pool-id
@@ -177,6 +180,7 @@
           - "{{ tls.pool_tls_versions | default([]) | join(',') }}"
           - --tls-ciphers
           - "{{ tls.pool_tls_ciphers | default('') or '' }}"
+      no_log: true
       register: pool_tls_update
       when: scenario.backend_reencrypt | default(false) | bool
       changed_when: true

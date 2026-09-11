@@ -10,6 +10,8 @@ from typing import Any
 
 import yaml
 
+from openstack_auth import connect as openstack_connect
+
 
 def load_yaml(path: pathlib.Path) -> dict[str, Any]:
     if not path.exists():
@@ -38,11 +40,6 @@ def attr(obj: Any, name: str, default: Any = None) -> Any:
 
 
 def connect_from_config(config_path: pathlib.Path):
-    try:
-        import openstack
-    except ImportError as exc:
-        raise SystemExit("openstacksdk is required; run make bootstrap") from exc
-
     cfg = load_yaml(config_path)
     cloud_cfg = cfg.get("openstack") or {}
     admin_cloud = cloud_cfg.get("admin_cloud")
@@ -50,15 +47,11 @@ def connect_from_config(config_path: pathlib.Path):
         raise SystemExit(
             "openstack.admin_cloud is required for Amphora/Nova inventory capture"
         )
-
-    # Amphora inventory is admin-only in Octavia, and the associated Nova
-    # server/host metadata also requires operator visibility. Keep this separate
-    # from openstack.cloud so benchmark provisioning still uses tenant credentials.
-    kwargs: dict[str, Any] = {"cloud": admin_cloud}
     region = cloud_cfg.get("region_name")
-    if region:
-        kwargs["region_name"] = region
-    return openstack.connect(**kwargs)
+    try:
+        return openstack_connect(admin_cloud, str(region) if region else None)
+    except (RuntimeError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def nova_details(conn: Any, compute_id: str) -> dict[str, Any]:

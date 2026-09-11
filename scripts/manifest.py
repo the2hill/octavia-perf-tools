@@ -19,6 +19,19 @@ def load_yaml(path: Path, default: Any = None) -> Any:
     return ({} if default is None else default) if value is None else value
 
 
+def safe_openstack_metadata(value: Any) -> dict[str, Any]:
+    src = value if isinstance(value, dict) else {}
+    cloud = src.get("cloud")
+    admin_cloud = src.get("admin_cloud")
+    return {
+        "cloud": cloud if isinstance(cloud, str) else "inline-tenant",
+        "admin_cloud": admin_cloud if isinstance(admin_cloud, str) else "inline-admin",
+        "region_name": src.get("region_name"),
+        "environment_label": src.get("environment_label"),
+        "validate_certs": src.get("validate_certs"),
+    }
+
+
 def compact_flavor(value: Any, fallback_name: str | None = None) -> dict[str, Any]:
     src = value if isinstance(value, dict) else {}
     return {
@@ -414,7 +427,7 @@ def build_manifest(result_dir: Path) -> dict[str, Any]:
         "metadata": cfg.get("metadata") or {},
         "target": target,
         "scenario": scenario,
-        "cloud": cfg.get("openstack") or {},
+        "cloud": safe_openstack_metadata(cfg.get("openstack") or {}),
         "observability": {
             "grafana": cfg.get("grafana") or {},
             "prometheus_diagnostics": {

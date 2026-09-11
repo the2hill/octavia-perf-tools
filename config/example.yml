@@ -10,12 +10,35 @@ metadata:
   notes: null
 
 openstack:
-  # Tenant/project cloud used for provisioning and benchmark operations.
-  cloud: sjc3
-  # Separate operator/admin clouds.yaml profile used only to capture Octavia
-  # Amphora inventory and the backing Nova/Neutron details. Do not grant these
-  # permissions to the benchmark tenant profile.
-  admin_cloud: sjc3-admin
+  # Tenant/project identity used for provisioning and benchmark operations.
+  # This is a complete openstacksdk/Ansible cloud configuration; no clouds.yaml
+  # entry is required. Replace the placeholders in config/local.yml only.
+  cloud:
+    auth_type: password
+    auth:
+      auth_url: https://identity.example.com/v3
+      username: benchmark-tenant-user
+      password: CHANGE_ME
+      project_name: benchmark-project
+      user_domain_name: Default
+      project_domain_name: Default
+    interface: public
+    verify: true
+
+  # Operator/admin identity used only for Amphora inventory and backing
+  # Nova/Neutron diagnostics. Keep it distinct from the benchmark tenant.
+  admin_cloud:
+    auth_type: password
+    auth:
+      auth_url: https://identity.example.com/v3
+      username: benchmark-operator-user
+      password: CHANGE_ME
+      project_name: admin
+      user_domain_name: Default
+      project_domain_name: Default
+    interface: public
+    verify: true
+
   region_name: SJC3
   # Free-form label recorded in every run manifest; it is documentation only.
   environment_label: api.sjc3.rackspacecloud.com

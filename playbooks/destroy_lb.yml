@@ -36,12 +36,13 @@
           - "{{ root_dir }}/scripts/barbican_secret.py"
           - delete
           - --cloud
-          - "{{ openstack.cloud }}"
+          - "{{ openstack.cloud | to_json }}"
           - --region
           - "{{ openstack.region_name | default('') }}"
           - --ref
           - "{{ item }}"
       loop: "{{ secret_state.secret_refs | default([]) if secret_state_file.stat.exists else [] }}"
+      no_log: true
       changed_when: true
       failed_when: false
 

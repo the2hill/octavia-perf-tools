@@ -51,7 +51,8 @@
               'run_prefix': run_prefix,
               'metadata': metadata | default({}),
               'openstack': {
-                'cloud': openstack.cloud,
+                'cloud': (openstack.cloud if openstack.cloud is string else 'inline-tenant'),
+                'admin_cloud': (openstack.admin_cloud if openstack.admin_cloud is string else 'inline-admin'),
                 'region_name': openstack.region_name | default(None),
                 'environment_label': openstack.environment_label | default(None),
                 'validate_certs': openstack.validate_certs | default(True)

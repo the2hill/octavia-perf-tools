@@ -28,6 +28,20 @@ def required(cfg: dict[str, Any], dotted: str) -> Any:
     return cur
 
 
+def validate_cloud_config(name: str, value: Any) -> None:
+    if isinstance(value, str):
+        if not value.strip():
+            die(f"openstack.{name} must not be empty")
+        return
+    if not isinstance(value, dict):
+        die(f"openstack.{name} must be a named cloud string or complete cloud mapping")
+    auth = value.get("auth")
+    if not isinstance(auth, dict):
+        die(f"openstack.{name}.auth must be a mapping for inline credentials")
+    if not auth.get("auth_url"):
+        die(f"openstack.{name}.auth.auth_url is required for inline credentials")
+
+
 def main() -> None:
     if len(sys.argv) != 2:
         die("usage: validate_config.py CONFIG.yml")
@@ -49,6 +63,10 @@ def main() -> None:
         "vm.image",
     ):
         required(cfg, dotted)
+
+    openstack_cfg = cfg.get("openstack") or {}
+    validate_cloud_config("cloud", openstack_cfg.get("cloud"))
+    validate_cloud_config("admin_cloud", openstack_cfg.get("admin_cloud"))
 
     cidr = ipaddress.ip_network(cfg["ssh"]["operator_cidr"], strict=False)
     if cidr.version != 4:

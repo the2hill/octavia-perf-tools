@@ -12,6 +12,8 @@ from typing import Any
 
 import yaml
 
+from openstack_auth import connect as openstack_connect
+
 from topology import direct_backend_reachable, resolved_generator_network_mode
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -336,24 +338,14 @@ def resolve_octavia_flavor(config: pathlib.Path, flavor: str) -> dict[str, Any] 
     if flavor == "default":
         return None
 
-    try:
-        import openstack
-    except ImportError as exc:
-        raise RuntimeError(
-            "openstacksdk is required to resolve the Octavia flavor; run make bootstrap"
-        ) from exc
-
     cfg = yaml.safe_load(config.read_text()) or {}
     cloud_cfg = cfg.get("openstack") or {}
     cloud = cloud_cfg.get("cloud")
     if not cloud:
         raise RuntimeError("openstack.cloud is required to resolve the Octavia flavor")
 
-    connect_args: dict[str, Any] = {"cloud": cloud}
     region = cloud_cfg.get("region_name")
-    if region:
-        connect_args["region_name"] = region
-    conn = openstack.connect(**connect_args)
+    conn = openstack_connect(cloud, str(region) if region else None)
     obj = conn.load_balancer.find_flavor(flavor, ignore_missing=True)
     if obj is None:
         raise RuntimeError(f"Octavia flavor {flavor!r} was not found")

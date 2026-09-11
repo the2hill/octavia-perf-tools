@@ -8,14 +8,8 @@ import pathlib
 import time
 from urllib.parse import urlparse
 
-import openstack
+from openstack_auth import connect
 
-
-def connect(cloud: str, region: str | None):
-    kwargs = {"cloud": cloud}
-    if region:
-        kwargs["region_name"] = region
-    return openstack.connect(**kwargs)
 
 
 def secret_id(value: str) -> str:

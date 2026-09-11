@@ -7,15 +7,9 @@ import json
 import pathlib
 from typing import Any
 
-import openstack
 import yaml
 
-
-def connect(cloud: str, region: str | None):
-    kwargs: dict[str, Any] = {"cloud": cloud}
-    if region:
-        kwargs["region_name"] = region
-    return openstack.connect(**kwargs)
+from openstack_auth import cloud_label, connect
 
 
 def as_dict(resource: Any) -> Any:
@@ -69,8 +63,8 @@ def main() -> None:
 
     cfg = yaml.safe_load(pathlib.Path(args.config).read_text()) or {}
     cloud_cfg = cfg.get("openstack") or {}
-    cloud = str(cloud_cfg.get("cloud") or "")
-    admin_cloud = str(cloud_cfg.get("admin_cloud") or "")
+    cloud = cloud_cfg.get("cloud")
+    admin_cloud = cloud_cfg.get("admin_cloud")
     region = str(cloud_cfg.get("region_name") or "") or None
     if not cloud:
         raise SystemExit("openstack.cloud is required in the benchmark config")
@@ -83,8 +77,8 @@ def main() -> None:
         "captured_at_utc": dt.datetime.now(dt.timezone.utc)
         .replace(microsecond=0)
         .isoformat(),
-        "cloud": cloud,
-        "admin_cloud": admin_cloud,
+        "cloud": cloud_label(cloud, "inline-tenant"),
+        "admin_cloud": cloud_label(admin_cloud, "inline-admin"),
         "region": region,
         "requested_load_balancer": args.load_balancer,
         "errors": {},
