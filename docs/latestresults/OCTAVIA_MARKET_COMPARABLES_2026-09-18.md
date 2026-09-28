@@ -3,7 +3,7 @@
 **Status:** Updated after September 18, 2026 full-flavor / multi-scenario campaign
 **Benchmark date:** 2026-09-18 UTC
 **Scope:** Rackspace Amphora/HAProxy service positioning, public cloud comparables, price/capacity signals, and measured scenario envelopes
-**Important:** This is a market-positioning document, not a final price book or performance SLA. The September 18 campaign adds materially stronger evidence for Pro/Elite differentiation, but TLS CPS, connection churn/capacity, bandwidth, floating-IP path, host-density, and HA/failover campaigns remain open.
+**Important:** This is a market-positioning document, not a final price book or performance SLA. This revision uses the supplied September 18 `comparison-summary.csv`, `selected-runs.csv`, the rebuild/run script, and the Elite 500->4000-user Locust history. The rebuild campaign itself exercised four core 1-KiB keepalive scenarios across the flavor matrix plus one separate Elite-only HTTP concurrency staircase. CPS/churn, simultaneous-connection, and dedicated 64-KiB/1-MiB bandwidth scenarios were **not part of this rebuild campaign**, so this revision does not invent current-MQ values for them. Floating-IP path, host-density, and HA/failover evidence remain separate product-validation workstreams.
 
 ---
 
@@ -13,16 +13,18 @@ The September 18 campaign materially strengthens the case for differentiated Amp
 
 ## Current measured HTTP/TLS scenario envelope
 
-The table below uses the September 18 three-run matrix supplied from `comparison-summary.csv`. `median_primary` is the reported scenario primary metric (`peak_rps_history`) for the normal staircase campaign; it is **not** the same metric as `max_sustainable_rps` from an adaptive max-RPS search.
+The normal staircase reports `median_peak_rps` / `peak_rps_history`; it is **not** the same statistic as adaptive `max_sustainable_rps`. The Elite HTTP results need to be split by workload fingerprint: the standard flavor-matrix suite (`suite_id=20260918T052148584530Z`, fingerprint `e7d6d69cf590adfc`) has three homogeneous runs at **89,687.7 / 93,180.9 / 94,680.4 RPS**, giving a clean median of **93,180.9 RPS**. The later Elite-only 500->4000-user diagnostic (`suite_id=20260918T150526815939Z`, fingerprint `36c2a02206267288`) peaked at **126,722.8 RPS** and is analyzed separately below. The unfiltered 4-run `comparison-summary.csv` median of 93,930.65 RPS mixes those two populations and should not be used as the normal Elite matrix reference.
 
-| Scenario | Lite | Plus | Pro | Elite | Elite/Pro | Elite p99 | Elite failures | Notes |
+| Scenario | Lite | Plus | Pro | Elite | Elite/Pro | Elite p99 | Elite payload | Elite quality note |
 |---|---:|---:|---:|---:|---:|---:|---:|---|
-| HTTP 1-KiB keepalive | 13,470 RPS | 16,112 RPS | 57,309 RPS | **93,181 RPS** | **1.63x** | 130 ms | 0% | Elite max across runs reached 126,723 RPS; high run-to-run spread means staircase peak is not a single fixed ceiling. |
-| TLS passthrough 1-KiB keepalive | 25,930 RPS | 23,221 RPS | 72,766 RPS | **140,975 RPS** | **1.94x** | 98 ms | 0% | Strongest Elite scenario; no reported failures at the primary result. |
-| TLS termination 1-KiB keepalive | 9,920 RPS | 12,248 RPS | 40,779 RPS | **73,892 RPS** | **1.81x** | 160 ms | 0% | Crypto termination materially lowers absolute RPS versus passthrough, as expected. |
-| TLS termination + backend re-encryption | 10,330 RPS | 14,323 RPS | 47,634 RPS | **64,592 RPS** | **1.36x** | 180 ms | 0.184% | Pro/Plus had much higher failure percentages in this campaign; re-encryption is currently the harshest normal scenario. |
+| HTTP 1-KiB keepalive | 13,470 RPS | 16,112 RPS | 57,309 RPS | **93,181 RPS** | **1.63x** | 130 ms | 0.763 Gbit/s | Homogeneous 3-run standard-matrix population; 0 failures and no validity/bottleneck warnings. |
+| TLS passthrough 1-KiB keepalive | 25,930 RPS | 23,221 RPS | 72,766 RPS | **140,975 RPS** | **1.94x** | 98 ms | 1.155 Gbit/s | 0 total failures, but **2 of 3 Elite runs carried resource warnings**; treat 141k as an observed peak class, not yet a clean publishable ceiling. |
+| TLS termination 1-KiB keepalive | 9,920 RPS | 12,248 RPS | 40,779 RPS | **73,892 RPS** | **1.81x** | 160 ms | 0.605 Gbit/s | 0 Elite failures and 0 resource-warning runs. |
+| TLS termination + backend re-encryption | 10,330 RPS | 14,323 RPS | 47,634 RPS | **64,592 RPS** | **1.36x** | 180 ms | 0.529 Gbit/s | Elite recorded 3,892 total failures across 3 runs; lower tiers recorded millions of failures, so their peak-RPS values are not quality-gated capacity points. |
 
-These scenario-specific values are more appropriate for product sizing than a single global “Elite RPS” claim. In particular, **Elite is not universally 2x Pro**: it is ~1.94x in TLS passthrough, ~1.81x in TLS termination, ~1.63x in plain HTTP, and ~1.36x with backend re-encryption in this campaign.
+These scenario-specific values are more appropriate for product sizing than a single global “Elite RPS” claim. In the homogeneous standard-matrix populations, Elite is ~**1.63x** Pro for plain HTTP, ~1.94x for TLS passthrough, ~1.81x for TLS termination, and ~1.36x for re-encryption. The separate Elite concurrency diagnostic reaches a higher plain-HTTP peak, but it uses a different workload fingerprint and must remain a separate evidence point.
+
+The latest summary also makes an important methodological distinction: **zero failures does not automatically mean a run is unconstrained**. Elite TLS passthrough has zero aggregate failures but resource warnings in 2/3 runs, so the 140,975-RPS median should not be promoted as a clean service ceiling until those warnings are identified and either eliminated or shown to be irrelevant.
 
 ## Adaptive max-RPS reference remains important
 
@@ -65,9 +67,9 @@ This is not an SLA equivalence. DigitalOcean's number is a documented product ma
 
 ### Interpretation
 
-At the clean Elite result, one active Amphora is delivering roughly the HTTP request-rate class that DigitalOcean exposes through **13 capacity nodes**.
+At the clean adaptive Elite HTTP result, one active Amphora is delivering roughly the HTTP request-rate class that DigitalOcean exposes through **13 capacity nodes**. The homogeneous normal-matrix HTTP median is **~93.2k RPS** (roughly a 10-node class), while the separate concurrency diagnostic peaks at **~126.7k RPS** (roughly a 13-node class). This spread is exactly why the measurement method and workload fingerprint must accompany any market comparison.
 
-That does not automatically mean Elite should cost $156/month. It means that a single-active Elite list price in roughly the low-to-mid hundreds per month can be justified in market terms if the remaining TLS/connection/bandwidth tests are similarly strong.
+That does not automatically mean Elite should cost $156/month. It means that a single-active Elite list price in roughly the low-to-mid hundreds per month can be justified in market terms if the remaining CPS, simultaneous-connection, dedicated-bandwidth, density, and HA evidence supports the same tier separation.
 
 ## 2.2 DigitalOcean's older vertical proxy benchmark
 
@@ -310,7 +312,7 @@ The new Amphora service can justify a separate price ladder if it exposes richer
 | Azure Application Gateway v2 | Fixed gateway charge plus capacity-unit billing across compute, persistent connections and throughput | No single RPS conversion is defensible because multiple capacity dimensions can dominate | Reinforces publishing a multi-dimensional Rackspace envelope. Rackspace's advantage would be simpler flat flavor pricing, not necessarily universally lower cost. |
 | Rackspace Spot LB | **$10/mo** fixed entry price; no public RPS envelope | No performance-equivalent mapping to Pro/Elite | Internal proof that customers understand simple fixed LB pricing, but not a capacity comparator for a 60k/128k Amphora tier. |
 | **Rackspace Octavia Pro MQ** | Proposed flat flavor; clean adaptive HTTP reference **~60.3k median sustainable RPS**; September normal-staircase peaks: HTTP **57.3k**, TLS passthrough **72.8k**, TLS termination **40.8k**, re-encryption **47.6k** | Market-positioning band currently **~$65-$90/mo** single-active | Best interpreted as a workload-specific capacity tier. DigitalOcean RPS-node math is most comparable to plain HTTP; TLS/CPS and connection dimensions need separate sizing. |
-| **Rackspace Octavia Elite MQ** | Proposed flat flavor; clean adaptive HTTP reference **~127.8k median sustainable RPS**; September normal-staircase peaks: HTTP **93.2k**, TLS passthrough **141.0k**, TLS termination **73.9k**, re-encryption **64.6k** | Market-positioning band currently **~$125-$165/mo** single-active | Strongest differentiated tier. Roughly 2x Pro in passthrough and termination, but only ~1.36x in re-encryption; future price/product claims should use per-scenario envelopes rather than one universal RPS number. |
+| **Rackspace Octavia Elite MQ** | Proposed flat flavor; clean adaptive HTTP reference **~127.8k median sustainable RPS**; September standard matrix: HTTP **93.2k**, TLS passthrough **141.0k**, TLS termination **73.9k**, re-encryption **64.6k**; separate HTTP concurrency diagnostic peaked at **126.7k** | Market-positioning band currently **~$125-$165/mo** single-active | Strongest differentiated tier. Keep the one-off concurrency staircase separate from the normal matrix; future price/product claims should use per-scenario envelopes rather than one universal RPS number. |
 
 ---
 
@@ -369,109 +371,136 @@ If the standby consumes a full equivalent VM reservation, the HA price has a rea
 
 ---
 
-# 13.1 Scenario-aware capacity is now part of the product story
+# 13. What the new results change about product strategy
 
-The September 18 campaign shows that the same Amphora flavor can have very different useful capacity depending on dataplane mode. The largest Elite/Pro separation is TLS passthrough (~1.94x), followed by TLS termination (~1.81x), plain HTTP (~1.63x), and full re-encryption (~1.36x).
+The September 18 campaign shows that the same Amphora flavor can have very different useful capacity depending on dataplane mode. In the homogeneous standard-matrix populations, the largest Elite/Pro separation is TLS passthrough (~1.94x), followed by TLS termination (~1.81x), plain HTTP (~1.63x), and full re-encryption (~1.36x).
 
-This suggests the eventual product matrix should avoid a single undifferentiated “RPS” promise. A better customer-facing model is a reference envelope by feature class:
+The product matrix should therefore avoid a single undifferentiated “RPS” promise. The useful customer-facing model is a workload-specific reference envelope:
 
 ```text
-HTTP/L7 keepalive       -> reference RPS
-TLS passthrough         -> reference RPS + CPS/connection tests
+HTTP/L7 keepalive       -> reference RPS + latency/failure gate
+TLS passthrough         -> reference RPS + connection/CPS evidence
 TLS termination         -> reference RPS + full-handshake CPS
-TLS re-encryption       -> reference RPS + backend TLS behavior
+TLS re-encryption       -> reference RPS + backend-TLS behavior
 connection churn        -> new connection/sec + p99
 active connections      -> simultaneous connection envelope
 bandwidth workloads     -> payload Gbit/s + packet-rate envelope
 ```
 
-The April/September public-comparator work therefore remains useful, but each external mapping should be clearly tied to a workload class. DigitalOcean's public 10k RPS/node number is strongest as a plain HTTP sizing anchor, while its published SSL-CPS and connection limits are better anchors for TLS and connection-focused comparisons.
-
-# 13. What the new results change about product strategy
+The DigitalOcean 10k-RPS/node number is strongest as a plain-HTTP sizing anchor. Its SSL-CPS and connection limits should be compared only with the corresponding Rackspace CPS/connection tests, not with keepalive RPS.
 
 ## 13.1 Elite is now a real product, not just a larger VM
 
-Before MQ, Elite's ~58k RPS made it difficult to justify a large premium over Pro. The new ~128k result changes that completely.
+Before MQ, Elite's ~58k RPS made it difficult to justify a large premium over Pro. The clean adaptive HTTP result changes that materially:
 
-The current HTTP result supports a clear customer story:
+- Pro: ~60.3k median sustainable HTTP RPS in the clean adaptive reference;
+- Elite: ~127.8k median sustainable HTTP RPS in the clean adaptive reference, ~2.12x Pro;
+- the homogeneous September HTTP matrix reports ~57.3k Pro and **~93.2k Elite** (three standard-fingerprint runs); the separate 500->4000-user Elite diagnostic peaked at ~126.7k and is not part of that matrix median;
+- TLS request-rate scaling is scenario dependent rather than universally 2x.
 
-- Pro: high-density, strong application LB capacity;
-- Elite: approximately 2.12x Pro on the separate clean adaptive HTTP max-RPS benchmark; the normal staircase shows a more conservative ~1.63x Elite/Pro ratio for the reported peak-RPS metric;
-- both: fixed capacity-flavor pricing rather than opaque request/byte billing.
+That supports a differentiated Elite tier, but it also means the service should publish the workload and measurement method beside any capacity number.
 
 ## 13.2 Vertical scaling is currently economically credible
 
-The clean adaptive 4->8 vCPU result is ~2.12x sustainable HTTP RPS for 2x guest vCPU. The normal staircase gives ~1.63x for its reported peak-RPS metric. Both point to meaningful vertical scaling after multiqueue, but the two metrics should not be conflated.
+The clean adaptive 4->8 vCPU result is ~2.12x sustainable HTTP RPS for 2x guest vCPU. The homogeneous September normal-staircase HTTP population gives **~1.63x** Pro->Elite scaling. TLS passthrough and termination scale even more strongly in the same matrix (~1.94x and ~1.81x), while re-encryption scales less strongly (~1.36x).
 
-The next question is no longer “does 8 vCPU help?” It is:
+The next architectural breakpoint is therefore not “does 8 vCPU help?” but:
 
 > At what flavor size does vertical scaling stop being cheaper than horizontal active-active architecture?
 
-That breakpoint still needs 16-vCPU experiments, host NUMA/locality testing, and potentially a multi-active architecture study.
+That still needs 16-vCPU experiments, host NUMA/locality testing, and potentially a multi-active architecture study.
 
 ## 13.3 MQ should be treated as a product prerequisite
 
 The competitive conclusion depends on a correctly configured dataplane. The old single-queue Elite result would have materially underpriced or over-resourced the product if used for commercial sizing.
 
-Virtio MQ exposure and active queue count should therefore become part of Amphora image/flavor acceptance testing, not an optional tuning detail.
+Virtio MQ exposure, active queue count, and observed queue/IRQ distribution should therefore become part of Amphora image/flavor acceptance testing rather than an optional tuning detail.
 
 ## 13.4 Publish a reference envelope, not only vCPU count
 
-Most customers do not care that Elite has 8 vCPU. They care what it can do.
+Most customers do not care that Elite has 8 vCPU. They care what it can do. The table below replaces the old `TBD`-heavy version with the measurements currently present in the September 18 comparison data.
 
-A strong Rackspace product page could eventually publish a tested reference envelope such as:
+### Current measured request-rate envelope
 
-| Dimension | Standard | Pro | Elite |
-|---|---:|---:|---:|
-| Reference HTTP RPS | measured | ~60k adaptive / ~57k normal staircase | ~128k adaptive / ~93k normal staircase |
-| Reference HTTPS termination RPS | TBD | TBD | TBD |
-| TLS CPS | TBD | TBD | TBD |
-| TCP CPS | TBD | TBD | TBD |
-| Simultaneous connections | TBD | TBD | TBD |
-| Reference payload throughput | TBD | TBD | TBD |
-| Reference p99 | measured | measured | 6 ms current HTTP point |
-| CPU placement / consistency | shared candidate | mixed candidate | dedicated candidate |
+Each cell reports **median peak RPS / median p99 / median peak payload Gbit/s**. These are engineering observations, not unconditional SLA guarantees. For Elite HTTP, the table uses the three homogeneous standard-matrix runs (`e7d6d69cf590adfc`) rather than the unfiltered 4-run aggregate, which also contains the separate concurrency diagnostic.
 
-The word **reference** is important. Until enforcement/SLO semantics are designed, these should be published as sizing guidance under a defined benchmark workload rather than unconditional guarantees.
+| Scenario | Lite | Plus | Pro | Elite | Current quality signal |
+|---|---:|---:|---:|---:|---|
+| HTTP 1-KiB keepalive | **13.5k / 840 ms / 0.110 Gb/s** | **16.1k / 670 ms / 0.132** | **57.3k / 220 ms / 0.469** | **93.2k / 130 ms / 0.763** | Homogeneous 3-run Elite matrix population; 0 failures, 0 validity warnings, 0 bottleneck warnings. |
+| TLS passthrough 1-KiB | **25.9k / 450 ms / 0.212 Gb/s** | **23.2k / 460 ms / 0.190** | **72.8k / 170 ms / 0.596** | **141.0k / 98 ms / 1.155** | Lite: 21,472 total failures; Plus: 54,075; Pro/Elite: 0. **Elite has resource warnings in 2/3 runs.** |
+| TLS termination 1-KiB | **9.9k / 1000 ms / 0.081 Gb/s** | **12.2k / 890 ms / 0.100** | **40.8k / 250 ms / 0.334** | **73.9k / 160 ms / 0.605** | Lite: 2,010 total failures; Plus: 667; Pro/Elite: 0. No resource-warning runs. |
+| TLS termination + re-encryption | **10.3k / 10,000 ms / 0.085 Gb/s** | **14.3k / 10,000 ms / 0.117** | **47.6k / 320 ms / 0.390** | **64.6k / 180 ms / 0.529** | Lite: 3,039,021 failures; Plus: 4,077,378; Pro: 4,353,654; Elite: 3,892. No resource-warning runs, but lower-tier peaks clearly fail quality gating. |
+| Clean adaptive HTTP sustainable RPS | current clean value not imported | current clean value not imported | **~60.3k**, 11 ms accepted p99, 0% failures | **~127.8k**, 6 ms accepted p99, 0% failures | Separate adaptive-search dataset; do not merge numerically with staircase peaks. |
+
+The payload values above are the benchmark's `median_peak_payload_gbps` for the 1-KiB scenarios. They are useful observed payload rates for these request-rate tests, but they are **not substitutes for dedicated 64-KiB/1-MiB bandwidth-ceiling scenarios**.
+
+The re-encryption row is especially important. The latest aggregate does not contain failure percentages or total-request denominators, so this revision intentionally reports **total failures** rather than carrying forward stale percentages from an older summary. Lite, Plus, and Pro clearly do not have quality-gated sellable capacity at those reported peak-RPS points. Elite is much cleaner, but its 3,892 failures still mean the 64.6k peak should be paired with an explicit failure/SLO gate before publication.
+
+### Elite HTTP concurrency-saturation diagnostic (separate population)
+
+The Elite-only run with fingerprint `36c2a02206267288` used six 60-second stages at 500, 750, 1000, 1500, 2000, and 4000 users. It is intentionally **not** another replicate of the standard flavor matrix. The table below uses the `Aggregated` rows from `locust_stats_history.csv`; RPS values are medians/peaks within each 60-second user stage, and latency values are medians/maxima of the Locust history p95/p99 columns observed during that stage.
+
+| Users | Median RPS | Peak RPS | Median p95 | Median p99 | Max observed p99 | Failures |
+|---:|---:|---:|---:|---:|---:|---:|
+| 500 | **121,042.3** | 126,340.6 | 5 ms | 6 ms | 8 ms | 0 |
+| 750 | **122,244.5** | **126,722.8** | 8 ms | 9 ms | 9 ms | 0 |
+| 1,000 | **122,460.9** | 124,071.3 | 9 ms | 10 ms | 11 ms | 0 |
+| 1,500 | **122,022.9** | 123,217.0 | 13 ms | 15 ms | 17 ms | 0 |
+| 2,000 | **117,906.4** | 123,437.4 | 19 ms | 22 ms | 23 ms | 0 |
+| 4,000 | **108,535.5** | 115,411.2 | 42 ms | 56 ms | 59 ms | 0 |
+
+The saturation shape is more useful than the single 126.7k peak. Throughput is already essentially flat by 500-1000 users, remains around 122k through 1500 users, and then falls as concurrency rises further. Relative to the 1000-user median, the 2000-user stage is ~3.7% lower and the 4000-user stage ~11.4% lower, while median p99 rises from 10 ms to 22 ms and then 56 ms. This is strong evidence that additional offered concurrency beyond roughly 750-1500 users does not buy more throughput for this workload; it primarily consumes latency headroom.
+
+The run completed **42,935,645 requests with zero failures**. Its whole-run summary reports 126,722.8 peak RPS and 41 ms p99, but the stage history is the better source for explaining where the curve flattens.
+
+### Additional envelope dimensions not exercised in this rebuild campaign
+
+The September 18 rebuild/run script executed the four 1-KiB core keepalive scenarios plus the Elite-only HTTP concurrency staircase. The following scenario families exist in the harness and may have historical/pre-MQ evidence, but **they were not part of this rebuild campaign**. They therefore remain open current-MQ product-envelope dimensions rather than `TBD` placeholders or assumed completed work.
+
+| Dimension | Benchmark scenario family | Current documentation status |
+|---|---|---|
+| TCP/new-connection CPS-like rate | `http_1k_connection_churn` | **Not run in this rebuild campaign; current-MQ reference still required** |
+| TLS full-handshake CPS-like rate | `tls_termination_1k_connection_churn` | **Not run in this rebuild campaign; current-MQ reference still required** |
+| Simultaneous active connections | `*_connection_capacity_active`, `*_max_connections_active` | **Not run in this rebuild campaign; current-MQ reference still required** |
+| Dedicated payload/bandwidth ceiling | `http_64k_keepalive`, `http_1m_keepalive`, `tls_termination_64k_keepalive` | **Not run in this rebuild campaign; current-MQ reference still required** |
+
+Legacy/pre-MQ results should not populate the current commercial reference envelope because the multiqueue change materially altered dataplane scaling.
+
+The word **reference** remains important. Before publishing a product limit, Rackspace still needs to define the workload fingerprint and the acceptable latency/failure gate. The normal-staircase peaks above are evidence; the clean adaptive HTTP points are closer to the form of a sellable capacity reference because they explicitly applied quality gates.
 
 ---
 
-# 14. Remaining evidence required before final pricing
+# 14. Evidence still to fold into final pricing
 
-The new HTTP result is strong enough to change positioning, but it is not enough to finalize the price book.
+The core HTTP/TLS keepalive matrix is measured, and the Elite concurrency staircase now explains how the 8-vCPU tier behaves as offered concurrency rises. The remaining work is to **run** the missing current-MQ product-envelope dimensions and finish operational validation:
 
-The following campaigns still materially affect customer value and cost:
+1. **Run current-MQ TCP connection-churn tests** and report new-connection/sec with p99/failure gates.
+2. **Run current-MQ TLS connection-churn/full-handshake tests**; keep full handshakes distinct from resumed TLS sessions.
+3. **Run active/max simultaneous-connection tests** and distinguish an observed ceiling from a generator/source-port lower bound.
+4. **Run 64-KiB / 1-MiB bandwidth tests** and report both payload Gbit/s and packet rate; do not substitute the 1-KiB derived payload-rate calculation for a bandwidth test.
+5. **Optionally run adaptive max-RPS searches for TLS passthrough, termination, and re-encryption** if those are intended to become quality-gated product reference numbers rather than normal-staircase observations.
+6. **Floating-IP/public path performance** rather than only tenant-VIP.
+7. **Connection logging on/off** impact.
+8. **ACTIVE_STANDBY failover behavior under load**.
+9. **Host-density/noisy-neighbor tests** for Lite/Plus/Pro economics.
+10. **Dedicated PCPU / NUMA-local Elite validation** if Elite will carry a premium consistency claim.
+11. **Multi-Amphora-per-host stress** to determine actual sellable host density and gross margin.
 
-1. **TLS termination max RPS** — probably the most important next commercial comparator.
-2. **TLS full-handshake CPS** — expensive crypto path and a common published competitor limit.
-3. **TLS resumed-session CPS**.
-4. **HTTP/TCP connection churn**.
-5. **maximum simultaneous active connections**.
-6. **64-KiB / 1-MiB bandwidth ceilings**.
-7. **floating-IP/public path performance** rather than only tenant-VIP.
-8. **connection logging on/off**.
-9. **ACTIVE_STANDBY failover behavior under load**.
-10. **host-density/noisy-neighbor tests** for Standard/Pro economics.
-11. **dedicated PCPU / NUMA-local Elite validation** if Elite will carry a premium consistency claim.
-12. **multi-Amphora-per-host stress** to determine actual sellable host density and gross margin.
-
-If Elite's TLS/CPS envelope scales similarly to HTTP, the current provisional $125-$165 single-active market band becomes significantly easier to defend. If TLS scaling is materially weaker, the product should be positioned as a high-RPS HTTP/application tier rather than a universally 2x tier.
+The TLS request-rate question is already partially answered: Elite measured ~73.9k RPS for frontend TLS termination and ~64.6k RPS for termination plus backend re-encryption in the normal staircase. The remaining TLS commercial unknown is principally **new TLS handshakes/sec, resumed-session behavior, and the quality-gated sustainable point**, not whether TLS termination was tested at all.
 
 ---
 
 # 15. Current conclusion
 
-The new multiqueue data changes the competitive assessment in Rackspace's favor.
+The multiqueue data changes the competitive assessment in Rackspace's favor.
 
 The best defensible current statement is:
 
-> A properly configured 8-vCPU Amphora reached **~128k sustainable plain-HTTP 1-KiB RPS** in the clean three-run adaptive benchmark, with **6 ms best p99, 0% failures, and healthy generator headroom**; that is roughly **2.12x** the established 4-vCPU Pro MQ adaptive result. The September normal staircase separately reports **~93k median peak HTTP RPS for Elite versus ~57k for Pro** (~1.63x). The adaptive ~128k figure maps to roughly **13 DigitalOcean 10k-RPS capacity nodes**, while the normal-staircase ~93k figure maps to roughly **10 nodes**. Neither is a product-equivalence claim; these are workload-specific market-sizing anchors.
+> A properly configured 8-vCPU Amphora reached **~128k sustainable plain-HTTP 1-KiB RPS** in the clean three-run adaptive benchmark, with **6 ms accepted/best p99, 0% failures, and healthy generator headroom**. In the homogeneous September core matrix, Elite measured **~93.2k plain HTTP**, **~141.0k TLS passthrough**, **~73.9k TLS termination**, and **~64.6k TLS termination + re-encryption** median peak RPS. The separate Elite-only concurrency staircase independently peaked at **126.7k RPS at 750 users**, stayed near ~122k through 1500 users, then traded throughput for latency at 2000-4000 users with zero failures. These are workload-specific observations, not one universal RPS rating.
 
-That does **not** make Rackspace universally faster or cheaper than those providers. Their architectures, HA semantics, global reach, TLS behavior, autoscaling, bandwidth, and SLAs are different.
+That does **not** make Rackspace universally faster or cheaper than public-cloud alternatives. Architectures, HA semantics, autoscaling, global reach, TLS behavior, bandwidth, and SLA models differ.
 
-It does mean that the Amphora offering now has a credible performance basis for differentiated Pro and Elite tiers, and the fixed-price model can be commercially compelling for customers with sustained high-volume traffic.
-
-The next major pricing update should happen after the current user-concurrency diagnostic and the first clean TLS termination/CPS results.
+It does mean the Amphora offering now has a credible performance basis for differentiated Pro and Elite tiers. The next pricing refinement should add current-MQ CPS, simultaneous-connection, and dedicated-bandwidth campaigns, while preserving the completed TLS request-rate matrix and the separate Elite concurrency-saturation diagnostic.
 
 ---
 

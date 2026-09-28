@@ -2,22 +2,26 @@
 
 ## September 18, 2026 evidence update
 
-The September 18 campaign provides the strongest evidence so far that the current multiqueue Amphora dataplane scales materially better than the earlier single-queue configuration. The full three-run flavor/scenario matrix should now be treated as the current engineering baseline.
+The September 18 campaign provides the strongest evidence so far that the current multiqueue Amphora dataplane scales materially better than the earlier single-queue configuration. The standard flavor-matrix populations are now fully reconciled. Elite HTTP has three homogeneous standard-fingerprint runs at **89,687.7 / 93,180.9 / 94,680.4 RPS** (median **93,180.9 RPS**), while the later 500->4000-user Elite-only diagnostic uses a different fingerprint and remains a separate population.
 
 ### Normal-staircase results
 
-| Scenario | Lite | Plus | Pro | Elite | Elite/Pro | Elite median p99 | Elite failures |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| HTTP 1-KiB keepalive | 13,470 | 16,112 | 57,309 | **93,181** | **1.63x** | 130 ms | 0% |
-| TLS passthrough 1-KiB keepalive | 25,930 | 23,221 | 72,766 | **140,975** | **1.94x** | 98 ms | 0% |
-| TLS termination 1-KiB keepalive | 9,920 | 12,248 | 40,779 | **73,892** | **1.81x** | 160 ms | 0% |
-| TLS termination + re-encryption | 10,330 | 14,323 | 47,634 | **64,592** | **1.36x** | 180 ms | 0.184% |
+The unfiltered `comparison-summary.csv` contains four Elite HTTP rows because it combines the three-run standard flavor-matrix suite with the later Elite-only concurrency diagnostic. For the normal matrix below, Elite HTTP is therefore recalculated from the three matching standard-suite/fingerprint runs only. Values below are staircase peak-RPS observations, not adaptive sustainable ceilings.
 
-These are the `peak_rps_history` primary metrics from the normal staircase campaign and therefore should not be presented as equivalent to adaptive `max_sustainable_rps`. They are useful as feature-class capacity references.
+| Scenario | Lite | Plus | Pro | Elite | Elite/Pro | Elite p99 | Elite payload | Quality note |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| HTTP 1-KiB keepalive | 13,470 | 16,112 | 57,309 | **93,181** | **1.63x** | 130 ms | 0.763 Gb/s | Homogeneous 3-run standard-matrix population; 0 failures and no validity/bottleneck warnings. |
+| TLS passthrough 1-KiB keepalive | 25,930 | 23,221 | 72,766 | **140,975** | **1.94x** | 98 ms | 1.155 Gb/s | 0 Elite failures, but **2/3 Elite runs have resource warnings**. |
+| TLS termination 1-KiB keepalive | 9,920 | 12,248 | 40,779 | **73,892** | **1.81x** | 160 ms | 0.605 Gb/s | 0 Elite failures; no resource warnings. |
+| TLS termination + re-encryption | 10,330 | 14,323 | 47,634 | **64,592** | **1.36x** | 180 ms | 0.529 Gb/s | Elite: 3,892 total failures; Lite/Plus/Pro: millions of failures at their reported peaks. |
+
+These are `peak_rps_history`/`median_peak_rps` staircase results and therefore must not be presented as equivalent to adaptive `max_sustainable_rps`. They are useful as workload-specific observed envelopes. All four rows now use homogeneous normal-matrix populations. The TLS-passthrough result deserves special caution: zero failures coexist with resource warnings in two of three Elite runs, so ~141k is not yet a clean ceiling.
+
+The latest aggregate also provides `median_peak_payload_gbps` for these 1-KiB tests. That is useful dataplane evidence, but it is not the same as a dedicated 64-KiB or 1-MiB bandwidth-capacity test.
 
 ### Adaptive HTTP reference
 
-The clean three-run Elite `http_1k_max_rps` set remains approximately:
+The separate clean three-run Elite `http_1k_max_rps` set remains approximately:
 
 ```text
 median sustainable RPS: 127,756
@@ -29,11 +33,11 @@ generator CPU hot:       false
 validity warnings:       none
 ```
 
-This is now a strong, repeatable evidence point for the multiqueue Elite dataplane. The September normal staircase independently reports a median peak of ~93.2k RPS for Elite HTTP keepalive. The adaptive and staircase values answer different questions and should not be merged into one product limit. The earlier ~137k run remains a higher observed point but is not treated as the clean ceiling because all eight generators hit 100% CPU.
+This remains a strong, repeatable evidence point for the multiqueue Elite dataplane. The homogeneous September standard-matrix HTTP median is **~93.2k RPS** across three matching runs; the separate concurrency diagnostic peaked at **126.7k RPS** and is analyzed below. The adaptive and staircase datasets answer different questions and should not be merged into one product limit. The earlier ~137k run remains a higher observed point but is not treated as the clean ceiling because all eight generators hit 100% CPU.
 
 ### Updated engineering interpretation
 
-1. The earlier ~58k Pro/Elite plateau was a **configuration-dependent dataplane result**, not a fundamental 8-vCPU Amphora ceiling. Enabling virtio multiqueue and validating queue/HAProxy-thread distribution unlocked a much larger Elite envelope. The clean adaptive Elite result is ~127.8k sustainable RPS; the normal staircase median is ~93.2k peak HTTP RPS, reflecting a different test metric.
+1. The earlier ~58k Pro/Elite plateau was a **configuration-dependent dataplane result**, not a fundamental 8-vCPU Amphora ceiling. Enabling virtio multiqueue and validating queue/HAProxy-thread distribution unlocked a much larger Elite envelope. The clean adaptive Elite result is ~127.8k sustainable RPS. The homogeneous September HTTP matrix median is **~93.2k RPS**, while the separate Elite concurrency staircase peaks at 126.7k and shows where offered concurrency stops increasing throughput.
 
 2. **HAProxy worker distribution is healthy.** The observed Elite process has seven worker threads mapped one-to-one onto CPUs 1-7, with roughly 88-89% process CPU per thread during the observed heavy-load interval. This argues against one HAProxy worker being the immediate limiting resource.
 
@@ -41,9 +45,9 @@ This is now a strong, repeatable evidence point for the multiqueue Elite datapla
 
 4. **The two-housekeeping-CPU experiment remains interesting but is no longer the first priority.** The clean ~128k adaptive Elite result establishes a stable baseline. The user-scaling staircase should first show where CPU0, HAProxy workers, latency, or client/backend resources become limiting before sacrificing a HAProxy worker to a second housekeeping CPU.
 
-5. **TLS is now the next major optimization surface.** The Elite scenario ratios show much stronger scaling for passthrough than for full re-encryption. That makes TLS crypto, frontend termination, backend TLS, connection reuse, OpenSSL behavior, and handshake rate the next below-API evidence to collect.
+5. **TLS request-rate is now measured; TLS handshake/CPS behavior is the next optimization surface.** The Elite normal staircase measured ~141.0k RPS for passthrough, ~73.9k for frontend termination, and ~64.6k for termination plus backend re-encryption. Plain HTTP in the same homogeneous matrix measured ~93.2k RPS. The remaining TLS uncertainty is primarily full-handshake CPS, resumed-session behavior, connection reuse, OpenSSL behavior, and quality-gated sustainable limits rather than whether TLS termination can scale at all.
 
-6. **Product capacity should be scenario-specific and metric-specific.** The September normal matrix shows Elite is ~1.63x Pro for plain HTTP, ~1.94x for TLS passthrough, ~1.81x for TLS termination, but only ~1.36x for re-encryption. Separately, the clean adaptive HTTP benchmark is ~2.12x Pro. A single global “2x RPS” claim would therefore be too broad without specifying workload and benchmark method.
+6. **Product capacity should be scenario-specific and metric-specific.** The homogeneous September populations show Elite is ~1.63x Pro for plain HTTP, ~1.94x for passthrough, ~1.81x for termination, but only ~1.36x for re-encryption. Separately, the clean adaptive HTTP benchmark is ~2.12x Pro. A single global “2x RPS” claim would therefore be too broad without specifying workload and benchmark method.
 
 ---
 
@@ -53,7 +57,7 @@ The next material gains in the Amphora offering are unlikely to come from adding
 
 The most important conclusions are:
 
-1. **The earlier 4-vCPU versus 8-vCPU plateau was configuration-dependent.** After virtio multiqueue was enabled and verified, the clean Elite adaptive HTTP result rose to a median ~127.8k sustainable RPS across three runs, while the normal staircase campaign produced ~93.2k median peak HTTP RPS, ~141.0k TLS-passthrough RPS, ~73.9k TLS-termination RPS, and ~64.6k re-encryption RPS. The current evidence therefore supports real vertical scaling once the virtio datapath is parallelized.
+1. **The earlier 4-vCPU versus 8-vCPU plateau was configuration-dependent.** After virtio multiqueue was enabled and verified, the clean Elite adaptive HTTP result rose to a median ~127.8k sustainable RPS across three runs. The September standard matrix measured **~93.2k plain-HTTP RPS**, ~141.0k TLS-passthrough RPS, ~73.9k TLS-termination RPS, and ~64.6k re-encryption RPS for Elite. The separate concurrency diagnostic independently peaked at 126.7k and maintained roughly 122k median RPS through 1500 users before degrading at higher concurrency. The current evidence therefore supports real vertical scaling once the virtio datapath is parallelized.
 
 2. **The current ~128k clean Elite reference is no longer generator-limited.** The three adaptive Elite runs reported `generator_limited=false`, `generator_cpu_hot=false`, and no validity warnings. The prior ~137k run is retained as a higher observed point but excluded from the primary ceiling because all eight generators were CPU-hot. The next diagnostic is therefore about server-side resource behavior rather than recovering basic client headroom.
 
@@ -79,11 +83,30 @@ The most important conclusions are:
 
 13. **A production density limit must be based on correlated load, not Placement arithmetic.** A ratio of 6 may be entirely healthy when 20% of Amphorae are busy and unacceptable when 75-100% burst simultaneously. The host-density campaign must measure per-Amphora RPS/p99 together with physical CPU, run queue, softirq, vhost/QEMU workers, OVN/OVS, NIC PPS, drops, and memory pressure.[^14]
 
-14. **The near-term sequence should now pivot from basic queue validation to scenario-specific bottleneck isolation:** finish the user-concurrency staircase; capture CPU0 versus CPU1-7 behavior at each level; quantify backend and generator headroom; then move into TLS crypto/CPS, connection churn, listener sharding, connection reuse, and only later the two-housekeeping-CPU A/B. The multiqueue fix should remain the production baseline for all future flavor comparisons.
+14. **The near-term sequence should now pivot from request-rate characterization to the remaining scenario dimensions:** preserve the current multiqueue keepalive matrix and the Elite concurrency-saturation diagnostic as the baseline; then run current-MQ connection-churn/CPS, simultaneous-connection, and dedicated-bandwidth campaigns with explicit quality gates. The September rebuild script did not include those scenario families. Only after those data exist should listener sharding, connection reuse, TLS-stack work, or a two-housekeeping-CPU A/B be prioritized against a concrete bottleneck. The multiqueue fix should remain the production baseline for all future flavor comparisons.
 
 ---
 
-## 1. Scope
+### Elite 500->4000-user HTTP concurrency diagnostic
+
+The rebuild campaign included a separate Elite-only `http_1k_keepalive` run with fingerprint `36c2a02206267288`. It used six 60-second stages at 500, 750, 1000, 1500, 2000, and 4000 users. This population must remain separate from the standard flavor-matrix fingerprint.
+
+Using the `Aggregated` rows from `locust_stats_history.csv`:
+
+| Users | Median RPS | Peak RPS | Median p95 | Median p99 | Max observed p99 | Failures |
+|---:|---:|---:|---:|---:|---:|---:|
+| 500 | **121,042.3** | 126,340.6 | 5 ms | 6 ms | 8 ms | 0 |
+| 750 | **122,244.5** | **126,722.8** | 8 ms | 9 ms | 9 ms | 0 |
+| 1,000 | **122,460.9** | 124,071.3 | 9 ms | 10 ms | 11 ms | 0 |
+| 1,500 | **122,022.9** | 123,217.0 | 13 ms | 15 ms | 17 ms | 0 |
+| 2,000 | **117,906.4** | 123,437.4 | 19 ms | 22 ms | 23 ms | 0 |
+| 4,000 | **108,535.5** | 115,411.2 | 42 ms | 56 ms | 59 ms | 0 |
+
+The important result is the shape, not merely the 126.7k peak. The 500-1500 user stages form an approximately 121-122.5k RPS plateau, with the absolute peak occurring at 750 users. Increasing offered concurrency to 2000 users reduces median throughput by about 3.7% versus the 1000-user stage while doubling the observed median p99 from 10 ms to 22 ms. At 4000 users, median throughput is about 11.4% lower than at 1000 users while median p99 rises to 56 ms. No request failures were recorded across the entire 42,935,645-request run.
+
+This indicates that for this 1-KiB keepalive workload, the useful saturation region is already reached around 750-1500 concurrent Locust users. Higher offered concurrency mainly consumes latency headroom rather than increasing request throughput. The whole-run summary's 41 ms p99 is less informative for this purpose than the per-stage history because it blends all six concurrency levels together.
+
+# 1. Scope
 
 This report intentionally stays below the cloud product and API layer. It does not propose replacing Amphora with another Octavia provider and does not treat OVN Octavia as the direction of travel. The objective is to improve the existing Amphora/HAProxy offering on a dedicated OpenStack compute cluster.
 
@@ -1205,10 +1228,13 @@ That independently supports preserving Octavia's `http-reuse safe` behavior and 
 
 DigitalOcean's node limits explicitly separate RPS, concurrent connections, and new SSL CPS.[^8] This is the product-level reflection of the lower-level reality described in this report.
 
-For Amphora, the equivalent engineering scorecard should eventually include:
+For Amphora, the equivalent engineering scorecard should include:
 
 ```text
 HTTP keepalive RPS
+TLS passthrough RPS
+TLS termination RPS
+TLS termination + re-encryption RPS
 HTTP close / TCP CPS
 TLS full-handshake CPS
 TLS resumed CPS
@@ -1216,6 +1242,22 @@ simultaneous connection capacity
 payload Gbps
 p99/p999 at each supported envelope
 ```
+
+Current evidence status after the September 18 campaign and the latest supplied aggregate:
+
+| Dimension | Status in this report |
+|---|---|
+| HTTP keepalive RPS | **Measured for Lite / Plus / Pro / Elite**. Elite standard-matrix median is **93.2k RPS** across three matching runs (89.7k / 93.2k / 94.7k); the separate concurrency diagnostic peaks at 126.7k, and the separate adaptive Elite reference remains ~127.8k sustainable. |
+| TLS passthrough RPS | **Measured for all four flavors**; Elite median peak is 141.0k, but 2/3 Elite runs have resource warnings, so it is not yet a clean ceiling. |
+| TLS termination RPS | **Measured for all four flavors**; Elite median peak 73.9k with 0 failures/resource-warning runs in the aggregate. |
+| TLS termination + re-encryption RPS | **Measured for all four flavors**; Elite median peak 64.6k with 3,892 total failures; lower-tier peaks carry millions of failures and are not quality-gated capacity points. |
+| 1-KiB observed payload rate | **Measured as part of the core request-rate runs**: Elite standard-matrix medians are **0.763 / 1.155 / 0.605 / 0.529 Gb/s** for HTTP / passthrough / termination / re-encryption respectively. |
+| HTTP close / TCP CPS-like churn | **Not part of the September rebuild campaign; current-MQ reference still required**. |
+| TLS full-handshake CPS-like churn | **Not part of the September rebuild campaign; current-MQ reference still required**. |
+| Simultaneous connection capacity | **Not part of the September rebuild campaign; current-MQ reference still required**. |
+| Dedicated 64-KiB/1-MiB bandwidth ceilings | **Not part of the September rebuild campaign; current-MQ reference still required**. The 1-KiB payload rates above are not substitutes. |
+
+Older pre-MQ churn figures remain useful as historical evidence but should not be used as the current Amphora reference envelope because the multiqueue change materially altered scaling.
 
 ---
 
