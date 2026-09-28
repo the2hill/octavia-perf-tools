@@ -63,11 +63,11 @@ The most important conclusions are:
 
 3. **Octavia's supported CPU-pinning image is intentionally asymmetric.** With `diskimage-create.sh -m`, Octavia isolates all guest vCPUs except the first, removes `irqbalance`, sets IRQ affinity to the first CPU, enables `nohz_full` on the isolated CPUs, and has the Amphora agent pin HAProxy workers to vCPU1 and above.[^2] This is a sensible low-jitter design, but it deliberately creates a single housekeeping CPU. That makes vCPU0 saturation a predictable failure mode at sufficiently high PPS/CPS.
 
-4. **Virtio multiqueue is necessary to test, but merely exposing queues is not enough.** Nova documents that virtio-net defaults to a single queue pair, that multiqueue can scale network throughput with vCPU count, and that the guest must activate the queues with `ethtool -L` or equivalent persistent configuration.[^3] In an Octavia CPU-pinned image, however, the upstream IRQ policy may still concentrate interrupt processing on CPU0. Therefore queue count, queue activation, and per-queue IRQ affinity must all be verified independently.
+4. **Virtio multiqueue is now a resolved baseline requirement, not an open hypothesis.** The pre-MQ Amphora datapath exposed only one effective queue pair and concentrated NET_RX work on CPU0. After enabling `hw:vif_multiqueue_enabled=true` and recreating Amphorae, the 4-vCPU Pro guest was observed with four active combined queues; virtio queue IRQs were distributed q0->CPU0, q1->CPU1, q2->CPU2, q3->CPU3, and NET_RX processing spread across the guest instead of remaining almost entirely on CPU0. That change is the strongest causal explanation for the large post-MQ Elite scaling improvement. Future runs should still record queue count and affinity as fingerprint data, but the engineering question is no longer “does multiqueue work?”
 
-5. **The most promising Amphora-specific experiment is not “8 vCPU versus 4 vCPU”; it is “one housekeeping CPU versus a larger housekeeping budget.”** If CPU0 remains saturated after generator headroom is fixed and multiqueue is verified, compare the upstream model (`CPU0=kernel/IRQ`, `CPU1..N=HAProxy`) against a controlled experimental image that reserves two guest CPUs for kernel/IRQ/virtio work and leaves the remainder for HAProxy. Another branch is to retain one housekeeping CPU while selectively using RPS/RFS/XPS. Both approaches trade HAProxy worker count for packet-processing parallelism and must be measured rather than assumed.
+5. **A second housekeeping CPU is now a conditional experiment, not the immediate next step.** The current MQ baseline restored useful vertical scaling and the Elite concurrency staircase shows a clean throughput plateau before latency rises. Sacrificing an HAProxy worker to create another housekeeping CPU should only be tested if a current-MQ CPS, connection-capacity, or bandwidth workload again shows a specific CPU0/IRQ/softirq ceiling. On Pro, giving up one of three HAProxy worker CPUs is especially expensive; on Elite the trade is more plausible but still requires evidence.
 
-6. **HAProxy 2.8 itself contains a relevant scaling knob that deserves an A/B test: listener sharding.** HAProxy 2.8 added `tune.listener.default-shards`; multiple listener sockets reduce kernel-side contention when many threads compete on one listening socket. The default strategy is by thread group.[^4] On an Amphora with only one thread group, that may still mean a single shard. It is not the first knob to change while vCPU0 is a suspected softirq bottleneck, but it is a legitimate second-stage test for high connection rates and TLS CPS.
+6. **HAProxy 2.8 listener sharding remains a targeted CPS/accept-path experiment.** HAProxy 2.8 added `tune.listener.default-shards`; multiple listener sockets can reduce kernel-side contention when many threads compete on one listening socket.[^4] The right trigger is now a measured connection-accept/CPS limitation on the current-MQ baseline, not a generic suspicion that keepalive RPS is serialized. Keepalive RPS alone is insufficient to justify this change.
 
 7. **The Noble image changes the TLS discussion.** OpenStack 2025.1 changed the default Amphora base image to Ubuntu Noble, and Noble currently supplies HAProxy 2.8.16 linked against OpenSSL 3.x (`libssl3`).[^5][^6] HAProxy Technologies' more recent SSL-stack testing found significant full-handshake scaling differences between OpenSSL 3.x and alternative crypto stacks on large multicore systems.[^7] Those exact benchmark numbers cannot be projected onto an AMD EPYC Amphora, but they are strong evidence that the TLS library must be treated as part of the dataplane, not an invisible implementation detail.
 
@@ -174,9 +174,9 @@ The earlier 1-vCPU / 4-GiB Amphora work established a useful reference point:
 
 That was important because it ruled out the simplest explanations. The one-vCPU result behaved like a genuine guest-compute ceiling rather than a backend or hypervisor entitlement problem.
 
-## 2.2 The newer 4-vCPU versus 8-vCPU result is more important
+## 2.2 The pre-MQ 4-vCPU versus 8-vCPU plateau was the key diagnostic
 
-The later `http_1k_max_rps` campaign found:
+The original `http_1k_max_rps` campaign found:
 
 | Metric | Pro: 4 vCPU | Elite: 8 vCPU |
 |---|---:|---:|
@@ -191,31 +191,44 @@ The later `http_1k_max_rps` campaign found:
 | Peak TX PPS | ~113.4k | ~113.0k |
 | Median vCPU scheduling delay | 0.000417 s/s | 0.000472 s/s |
 
-The 0.85% median advantage was smaller than normal run-to-run variation. Doubling vCPU count did not materially move throughput, even though the 8-vCPU guest had substantially more aggregate CPU headroom.[^1]
+At the time, the 0.85% difference looked like a vertical-scaling failure: doubling vCPU count produced essentially no additional request throughput. That observation was real, but it was a property of the **pre-MQ datapath**, not an inherent HAProxy or 8-vCPU Amphora ceiling.[^1]
 
-This is exactly the kind of pattern that warrants per-CPU and per-queue investigation.
+## 2.3 The root cause was then identified and materially resolved
 
-## 2.3 Do not overstate the conclusion yet
-
-The generators were also near CPU saturation, with worker peaks generally in the 93-99% range.[^1] The correct interpretation is therefore:
-
-> There is clear evidence of a hot-vCPU condition inside the Amphora, but the measured ~58k RPS ceiling may be a co-limit between Amphora and generator capacity.
-
-The next run should increase generator VMs while leaving the server-side datapath unchanged. A clean diagnosis requires:
+The later packet-path inspection closed the most important uncertainty:
 
 ```text
-generator CPU comfortably below saturation
-        +
-direct nginx substantially above Octavia
-        +
-Octavia CPU0 still pinned near 100%
-        =
-strong Amphora/dataplane bottleneck evidence
+Pre-MQ Amphora
+  dataplane eth1: one effective RX/TX queue pair
+  rx-0 / tx-0 only
+  NET_RX: ~98.6% of observed softirq work on CPU0
+
+Post-MQ 4-vCPU Pro Amphora
+  dataplane eth1: Combined=4 maximum/current
+  rx-0..3 / tx-0..3 active
+  virtio queue IRQs: q0->CPU0, q1->CPU1, q2->CPU2, q3->CPU3
+  NET_RX: ~10.6% CPU0 and ~29.5-30.1% on CPUs1-3
 ```
 
-This sequencing matters. Tuning the guest before removing the generator ceiling risks attributing an improvement or regression to the wrong component.
+This is the strongest causal evidence in the investigation. The old queue topology forced a high-PPS virtio receive path through one guest CPU. The post-MQ topology distributed that work, and the Elite performance envelope increased dramatically.
 
----
+The clean adaptive references after the MQ change are approximately:
+
+| Metric | Pro MQ | Elite MQ | Elite/Pro |
+|---|---:|---:|---:|
+| Median sustainable HTTP RPS | ~60,264 | **~127,756** | **~2.12x** |
+| Accepted failures | 0% | 0% | - |
+| Best accepted p99 | 11 ms | 6 ms | - |
+| Generator limited | false | false | - |
+| Generator CPU hot | false | false | - |
+
+The September standard matrix independently shows workload-specific vertical scaling: Elite is ~1.63x Pro for plain HTTP, ~1.94x for TLS passthrough, ~1.81x for frontend TLS termination, and ~1.36x for termination plus backend re-encryption.
+
+Therefore the current interpretation is:
+
+> **The ~58k plateau is historical pre-MQ evidence. It should be retained because it explains the failure mode, but it must not be described as the current Amphora ceiling.**
+
+The generator question is also no longer a blanket blocker. The current benchmark fleet uses 16 Locust worker VMs with four worker processes each (64 worker processes total), and the clean adaptive Elite runs explicitly reported `generator_limited=false` and `generator_cpu_hot=false`. Generator headroom remains a per-workload validity check -- especially for the TLS-passthrough matrix where two Elite runs crossed the resource-warning threshold -- but “add more generators” is not the default next action.
 
 # 3. Octavia CPU pinning: why vCPU0 is special
 
@@ -244,29 +257,29 @@ vCPU1..N
 
 This is a strong design for keeping HAProxy workers predictable. It also creates an intentionally finite housekeeping budget.
 
-## 3.1 Why this can become a vertical-scaling wall
+## 3.1 Why this design created the pre-MQ vertical-scaling wall
 
-Suppose a 4-vCPU Amphora has:
+The upstream CPU-pinning design intentionally reserves CPU0 for kernel and IRQ work while placing HAProxy workers on CPUs1..N. In the old single-queue Amphora, that topology combined with one effective virtio RX/TX queue pair to create a real serial packet-delivery point.
+
+For the 4-vCPU shape:
 
 ```text
-CPU0: kernel / packet processing
+CPU0: kernel / packet processing / single virtio queue
 CPU1: HAProxy worker
 CPU2: HAProxy worker
 CPU3: HAProxy worker
 ```
 
-At low and medium load, adding HAProxy workers can scale request processing. At some point, however, all three workers depend on CPU0 delivering packets, TCP work, and socket events fast enough. If CPU0 reaches 100% while CPUs1-3 retain headroom, another HAProxy worker cannot fix the bottleneck.
-
-The 8-vCPU version can make this more obvious:
+For the 8-vCPU shape:
 
 ```text
-CPU0: one housekeeping CPU
-CPU1-7: seven HAProxy CPUs
+CPU0: housekeeping / IRQ / single virtio queue
+CPU1-7: HAProxy workers
 ```
 
-If the packet path still funnels through CPU0, HAProxy worker capacity may increase by more than 2x while packet-delivery capacity barely changes.
+Adding HAProxy workers could not help if one receive queue and its associated softirq path were still feeding all workers through CPU0. The observed pre-MQ NET_RX distribution -- ~98.6% on CPU0 -- is consistent with that mechanism, and the post-MQ scaling improvement strongly supports it.
 
-That is consistent with the current symptom, though it is not yet proven.
+The current MQ baseline changes the interpretation. Packet work can now be distributed across multiple queue/CPU paths, so the one-housekeeping-CPU design should **not** be assumed to be the active bottleneck. CPU0 remains worth monitoring, particularly for connection churn, TLS handshakes, and high-PPS workloads, but a two-housekeeping-CPU image is now an evidence-triggered branch rather than a presumed fix.
 
 ## 3.2 Exact evidence to collect
 
@@ -302,61 +315,56 @@ If CPU0 is instead high in HAProxy user time, inspect thread affinity/configurat
 
 ---
 
-# 4. Virtio-net multiqueue: expose, activate, then verify distribution
+# 4. Virtio-net multiqueue: resolved root cause and permanent baseline
 
-Nova documents that virtio-net normally presents one transmit/receive queue pair. Multiqueue allows multiple queue pairs and is specifically useful when a VM has multiple vCPUs and many active connections. Nova also warns that multiqueue increases CPU consumption.[^3]
+Nova documents that virtio-net normally presents one transmit/receive queue pair and that multiqueue allows multiple queue pairs for multi-vCPU guests.[^3] That distinction turned out to be central to this benchmark program.
 
-The flavor/image capability is only the first step:
+The required flavor capability remains:
 
 ```bash
 openstack flavor set <flavor> \
   --property hw:vif_multiqueue_enabled=true
 ```
 
-Inside the guest, Nova documents enabling the queues with:
+Existing Amphorae must be recreated before the new VIF capability is present. Guest activation/persistence also matters, so queue state must still be fingerprinted with `ethtool -l`.
 
-```bash
-ethtool -L <dev> combined <N>
-```
+## 4.1 What was actually observed
 
-where `N` is normally chosen in relation to guest vCPU count.[^3]
+### Historical pre-MQ state
 
-## 4.1 Three states must be distinguished
-
-### State A: multiqueue not exposed
+The original Amphora dataplane exposed one effective queue pair:
 
 ```text
-ethtool -l ethX
 Maximums: Combined: 1
+Current:  Combined: 1
+rx-0 / tx-0 only
 ```
 
-No amount of guest affinity tuning can parallelize that virtio receive path.
+During load, NET_RX processing was concentrated almost entirely on CPU0 (~98.6% of the observed NET_RX softirq work). That is no longer a theoretical concern; it is the diagnosed pre-MQ failure mode.
 
-### State B: multiqueue exposed but only one queue active
+### Current MQ state
 
-The virtual device supports several queues, but the guest is still using one effective pair. This is a common false-positive configuration: the flavor says multiqueue, so operators assume it is working.
+After enabling the multiqueue flavor property and recreating Amphorae, the 4-vCPU Pro dataplane was directly observed as:
 
-### State C: multiple queues active, but IRQs still converge on CPU0
+```text
+Maximums: Combined: 4
+Current:  Combined: 4
+rx-0..3 / tx-0..3 active
+```
 
-This state is particularly relevant to Octavia's CPU-pinning image. More virtqueues exist, but if the image intentionally forces their interrupts to CPU0, the packet-processing work can remain concentrated.
+The corresponding virtio queue IRQs were distributed q0->CPU0, q1->CPU1, q2->CPU2, q3->CPU3. NET_RX softirq work shifted to approximately 10.6% on CPU0 and ~29.5-30.1% on each of CPUs1-3.
 
-The important inference is:
+For Elite, the benchmark evidence confirms the post-MQ performance regime and healthy HAProxy worker placement, but the retained evidence package does not contain an equally explicit numeric `ethtool -l` capture for the 8-vCPU guest. Do **not** invent one. Future Elite runs should capture the exact queue count as routine fingerprint data even though MQ itself is no longer an unresolved hypothesis.
 
-> **queue count is not the same as CPU parallelism.**
+## 4.2 What still needs to be verified per run
 
-## 4.2 Required guest checks
+Multiqueue should now be treated like image ID or HAProxy version: a baseline invariant that is checked, not rediscovered. Capture:
 
 ```bash
-for nic in $(ls /sys/class/net | grep -v '^lo$'); do
-  echo "===== $nic channels ====="
-  ethtool -l "$nic"
-  echo "===== $nic stats ====="
-  ethtool -S "$nic" 2>/dev/null | head -200
-  echo "===== $nic features ====="
-  ethtool -k "$nic"
-done
-
+ethtool -l <dataplane-nic>
+ethtool -S <dataplane-nic>
 cat /proc/interrupts
+cat /proc/softirqs
 
 for f in /proc/irq/*/smp_affinity_list; do
   printf '%s: ' "$f"
@@ -374,25 +382,20 @@ for f in /sys/class/net/*/queues/tx-*/xps_cpus; do
 done
 ```
 
-Also collect per-queue packet/drop counters before and after the load interval.
+The purpose is regression detection. A new image, Nova/libvirt change, flavor regression, or guest configuration change must not silently return the service to a single-queue state.
 
-## 4.3 Recommended A/B order
+## 4.3 Future queue/IRQ A/B order
 
-Do not immediately spread all network processing over all CPUs. That would defeat the isolation model before proving it is necessary.
-
-Use this sequence:
+Do **not** rerun “single queue versus multiqueue” as though both were plausible production candidates. MQ is the known-good baseline. The next queue/IRQ experiments are conditional:
 
 ```text
-A. upstream CPU-pinning behavior + current queue state
-B. same image, multiqueue definitely activated
-C. multiqueue + measured/controlled queue-to-CPU affinity
-D. if CPU0 still limits, two-housekeeping-CPU image
-E. alternatively, one housekeeping CPU + selective RPS/RFS/XPS
+A. current MQ baseline + recorded queue/IRQ state
+B. if a workload shows one hot queue/CPU, current MQ + controlled IRQ/queue affinity
+C. if CPU0 remains a demonstrated limiter, current MQ + selective RPS/RFS/XPS
+D. only if justified, current MQ + two-housekeeping-CPU image
 ```
 
-Each state must be its own benchmark fingerprint.
-
----
+Each experimental state must have its own benchmark fingerprint. The objective is to fix a measured bottleneck without destroying the worker isolation that the Octavia `-m` image intentionally provides.
 
 # 5. RSS, RPS, RFS, and XPS: what they can and cannot fix
 
@@ -523,11 +526,11 @@ by-group
 
 and recommends caution with excessive per-thread sockets.[^19]
 
-For a small 4- or 8-vCPU Amphora, an experimental `by-thread` or small explicit shard count is reasonable **after** the guest queue/IRQ bottleneck is understood.
+For a small 4- or 8-vCPU Amphora, an experimental `by-thread` or small explicit shard count is reasonable **after a current-MQ connection-rate baseline shows an accept-path/CPS limitation**.
 
 Why not first?
 
-Because listener sharding optimizes connection acceptance among HAProxy threads. It does not solve a CPU0 that is saturated processing virtio/NAPI/TCP work before HAProxy receives the event.
+The old keepalive scaling problem was already resolved by virtio multiqueue. Listener sharding optimizes connection acceptance among HAProxy threads; it should therefore be evaluated with churn/CPS workloads, not used as a speculative fix for the historical single-queue plateau.
 
 ## 6.4 Use connection-rate workloads to evaluate sharding
 
@@ -604,7 +607,7 @@ This is also the right way to find whether CPU0 saturation belongs to packet pro
 
 ---
 
-# 9. TLS: likely the largest uncharacterized CPU variable
+# 9. TLS: request-rate is characterized; handshake/CPS is the remaining gap
 
 ## 9.1 Requests per second is not TLS capacity
 
@@ -1204,7 +1207,7 @@ DigitalOcean's 2020 synthetic HTTPS benchmark reported roughly:[^32]
 
 The benchmark is not directly comparable to Octavia, but it demonstrates a production operator obtaining useful vertical scaling from 1 to 4 proxy CPUs.
 
-This makes the current Amphora 4-vCPU/8-vCPU flat result more likely to represent a correctable data-path constraint than an inherent “HAProxy does not scale” property.
+That historical comparison turned out to be directionally correct: the old Amphora 4-vCPU/8-vCPU flat result was a correctable datapath constraint. After virtio multiqueue was enabled and verified, Elite showed substantial vertical scaling rather than remaining pinned near the old ~58k plateau.
 
 ## 21.2 DigitalOcean explicitly separated cheap packet forwarding from expensive HTTP/TLS work
 
@@ -1326,174 +1329,188 @@ Three repetitions are a reasonable exploratory floor. Compare:
 
 A 5% RPS improvement with 8% run variance is not a product result.
 
-## 23.3 The result is valid only if the load generator has headroom
+## 23.3 Generator validity is workload-specific, not a permanently open question
 
-For max-RPS testing, use the existing target of approximately:
+The current benchmark fleet is substantially larger than the original one: **16 Locust worker VMs x 4 worker processes = 64 worker processes**, plus 10 backend VMs. For adaptive HTTP, the clean Elite runs explicitly reported:
+
+```text
+generator_limited=false
+generator_cpu_hot=false
+validity_warnings=[]
+```
+
+That closes the old blanket concern that the ~58k plateau might simply be a four-generator ceiling.
+
+Generator headroom must still be checked on every workload. A useful interpretation remains:
 
 ```text
 preferred generator peak CPU: <= 70-75%
 exploratory upper bound:       < 80-85%
-invalid/ambiguous:             repeated > 85%
+resource warning:              repeated > 85%
 ```
 
-The present 93-99% generator CPU is too close to saturation for clean ceiling attribution.[^1]
+But crossing that warning threshold does not automatically invalidate the datapoint. For example, the September Elite TLS-passthrough matrix had zero failures and no validity warnings, while two of three runs recorded generator resource warnings around the high-80% CPU range. Those runs are useful observations but should not be called a clean server-side ceiling.
 
----
+Whenever the benchmark infrastructure itself is rebuilt or materially changed, rerun direct controls so new Octavia results are not compared against stale generator/backend placement.
 
 # 24. Recommended experiment program
 
-## Phase 0 - Remove benchmark ambiguity
+The investigation has moved past basic generator sizing and MQ enablement. The program should now preserve the known-good MQ baseline and fill the remaining product-envelope dimensions before introducing new dataplane changes.
 
-**Goal:** prove the test harness can exceed the Amphora.
+## Phase 0 - Lock the known-good baseline
 
-Actions:
+**Goal:** prevent regressions while the remaining scenarios are characterized.
 
-1. increase generator VMs from 4 to 8 while keeping per-VM process density unchanged;
-2. rerun direct nginx and `http_1k_max_rps`;
-3. require generator CPU headroom;
-4. retain the same backend, path, image, and flavor.
-
-Exit condition:
+Baseline invariants:
 
 ```text
-direct path materially above Octavia
-AND generator CPU not hot
+16 Locust worker VMs
+4 Locust worker processes per VM
+64 worker processes total
+10 backend VMs
+tenant_vip / shared network for the current reference set
+multiqueue-enabled Amphora flavors
+current supported Amphora image
+current HAProxy/OpenSSL versions
+current backend keepalive / http-reuse behavior
 ```
 
-If Octavia rises proportionally with the extra generators, the previous result was client-limited and the dataplane diagnosis must be updated.
+For each campaign, record:
+
+- exact image and flavor IDs;
+- exact spec fingerprint;
+- generator/backend placement;
+- `ethtool -l` queue state;
+- HAProxy `nbthread` / `cpu-map`;
+- generator CPU warnings;
+- failures and p99/p999.
+
+Direct controls should be rerun after infrastructure rebuilds or meaningful generator/backend changes, not as a mandatory phase before every unchanged campaign.
 
 ---
 
-## Phase 1 - Prove the hot-vCPU mechanism
+## Phase 1 - Complete the current-MQ service envelope
 
-**Goal:** determine what consumes vCPU0.
+**Goal:** characterize the dimensions that the September rebuild did not run.
 
-Collect during load:
+Run at least three repetitions per flavor for the harness's existing profiles:
 
 ```text
-mpstat per CPU
+http_1k_connection_churn
+tls_termination_1k_connection_churn
+http_max_connections_active
+tls_passthrough_max_connections_active
+tls_termination_max_connections_active
+tls_termination_reencrypt_max_connections_active
+http_64k_keepalive
+http_1m_keepalive
+tls_termination_64k_keepalive
+```
+
+The key outputs are no longer just RPS:
+
+```text
+TCP/HTTP connection establishment rate
+TLS full-handshake-like CPS
+maximum sustainable active connections
+connection establishment/survival failure rate
+payload Gbit/s
+PPS
+p95/p99/p999
+```
+
+Quality-gate each dimension independently. A peak with millions of failures is not a sellable capacity point.
+
+---
+
+## Phase 2 - Capture synchronized dataplane telemetry on the new limiting scenarios
+
+**Goal:** identify the actual bottleneck for CPS, connection state, and bandwidth rather than assuming the keepalive bottleneck repeats.
+
+Collect during the limiting step:
+
+```text
+per-vCPU mpstat
 /proc/interrupts
 /proc/softirqs
-virtio queue count
-per-queue packet counters
-IRQ affinity
-RPS/XPS masks
+virtio queue counters and IRQ affinity
 HAProxy thread CPU + PSR
-HAProxy runtime info
+HAProxy runtime ConnRate / SessRate / CurrConns / Idle_pct
+ss -s / nstat / listen overflow counters
+QEMU/vhost/ksoftirqd CPU on the host
+physical NIC PPS/Gbit/s/drops
+OVN/OVS CPU and conntrack pressure
+generator/backend CPU and network
 ```
 
-Decision:
-
-```text
-CPU0 mostly softirq + virtio interrupts
-    -> queue/IRQ/housekeeping branch
-
-CPU0 mostly HAProxy user CPU
-    -> affinity/configuration branch
-
-all HAProxy workers saturated
-    -> normal aggregate HAProxy CPU ceiling
-
-host vhost/OVN/NIC CPUs saturated first
-    -> host dataplane branch
-```
+Do not infer a CPU0 problem from the old single-queue campaign. Re-prove the limiting resource for each scenario family.
 
 ---
 
-## Phase 2 - Virtio and housekeeping A/B
+## Phase 3 - Targeted A/B based on the measured limiter
 
-For 4-vCPU and 8-vCPU test flavors:
+Choose the branch from evidence:
 
 ```text
-A  current upstream -m image behavior
-B  multiqueue exposed + proven active
-C  B + controlled queue/IRQ distribution
-D  B + two housekeeping guest CPUs
-E  B + selective RPS/RFS/XPS
+CPS / accept path limited
+  -> HAProxy listener sharding A/B
+  -> connection logging A/B
+
+CPU0 IRQ/softirq limited even with MQ
+  -> controlled queue/IRQ affinity
+  -> selective RPS/RFS/XPS
+  -> two-housekeeping-CPU Elite experiment only if still justified
+
+TLS worker/crypto limited
+  -> certificate/session matrix
+  -> OpenSSL/HAProxy profiling
+
+Bandwidth / host dataplane limited
+  -> host NIC RSS/IRQ locality
+  -> NUMA / vhost / QEMU placement
+  -> offload and ring diagnostics
+
+connection-state / memory limited
+  -> HAProxy maxconn/FD/socket-memory/timeout analysis
 ```
 
-Primary outputs:
-
-- sustainable RPS;
-- p99/p999;
-- hottest-vCPU utilization;
-- aggregate guest cores consumed;
-- packets per housekeeping CPU;
-- HAProxy `Idle_pct`;
-- guest drops/errors.
-
-The winning design is not necessarily the highest RPS. Prefer the design with the best performance per physical CPU and stable tail latency.
+Only change one dataplane dimension per benchmark fingerprint.
 
 ---
 
-## Phase 3 - HAProxy listener/connection-path A/B
+## Phase 4 - TLS certificate and session matrix
 
-Only after Phase 2 is understood:
+Once the current TLS-termination churn profile establishes a baseline, run:
 
 ```text
-A  current HAProxy 2.8 listener sharding behavior
-B  experimental tune.listener.default-shards by-thread
-C  controlled explicit shard count if template support permits
+RSA-2048 full handshake
+RSA-4096 full handshake
+ECDSA P-256 full handshake
+resumed-session CPS
+frontend TLS + backend re-encryption
 ```
 
-Run against:
-
-- HTTP keepalive;
-- HTTP close;
-- TCP churn;
-- TLS full-handshake CPS.
-
-If sharding improves CPS but not keepalive RPS, that is expected and useful.
+This converts the remaining TLS uncertainty from generic “TLS cost” into a customer-relevant CPS envelope.
 
 ---
 
-## Phase 4 - Logging A/B
-
-```text
-A current logging
-B connection_logging=False
-C B + disable_local_log_storage=True (if acceptable)
-```
-
-Keep image/flavor/network placement constant.
-
----
-
-## Phase 5 - TLS matrix
-
-Run the certificate/session matrix from Section 9 for 2-, 4-, and 8-vCPU candidates after the packet path is stable.
-
-This phase should answer:
-
-```text
-Does TLS CPS scale with HAProxy workers?
-Does CPU0 remain the ceiling?
-Does OpenSSL dominate worker CPU?
-What certificate choice most affects sellable capacity?
-Does re-encryption halve the useful CPS class or less/more?
-```
-
----
-
-## Phase 6 - Host locality and power
+## Phase 5 - Host locality and power
 
 A/B premium candidates across:
 
 ```text
 NUMA unconstrained vs hw:numa_nodes=1
-verified local vs remote-ish host placement where safely reproducible
+verified network/NUMA locality
 current governor vs performance profile
 SMT prefer/default vs isolate
 4K vs 2M pages
 ```
 
-This is where Elite's consistency proposition should be proven.
+This is primarily a consistency/p99 experiment, not an excuse to change the baseline before a problem is measured.
 
 ---
 
-## Phase 7 - Standard host-density campaign
-
-Do not use one Amphora per host.
+## Phase 6 - Standard host-density campaign
 
 For VCPU allocation ratios:
 
@@ -1519,45 +1536,19 @@ Run at least:
 - connection churn;
 - bandwidth/payload scenario.
 
-Measure per-Amphora distribution, not just aggregate host throughput.
-
-The decisive statistics are:
-
-```text
-minimum / p10 Amphora throughput
-median throughput
-p99 latency distribution across Amphorae
-run-to-run variance
-host CPU run queue
-vCPU delay/steal
-softirq CPU
-NIC PPS/drops
-vhost/QEMU CPU
-OVN/OVS CPU
-```
-
-This campaign sets the real Standard `max_instances_per_host` and safe allocation ratio.
+Measure the distribution across Amphorae, not just host aggregate throughput. This campaign sets the real Standard allocation ratio and `max_instances_per_host`.
 
 ---
 
-## Phase 8 - Pro mixed versus Elite dedicated
+## Phase 7 - Pro mixed versus Elite dedicated
 
-Use a common 4-vCPU example first:
-
-```text
-Pro-A: mixed, dedicated mask 0
-Pro-B: mixed, dedicated mask 0-1
-Pro-C: mixed, dedicated mask 0-2
-Elite: dedicated all vCPUs
-```
+Use controlled PCPU/VCPU masks to determine how much dedicated CPU Pro actually needs to preserve its commercial performance floor under contention. Elite remains the fully dedicated control.
 
 The commercial question is:
 
-> What is the smallest PCPU footprint that preserves the desired fraction of Elite performance and tail-latency consistency under contention?
+> What is the smallest physical-CPU footprint that preserves the desired SLO-compliant throughput and tail-latency consistency?
 
-If Pro-B consumes two PCPU + two shared VCPU and delivers nearly the same SLO-compliant throughput as four dedicated PCPU, it is a substantially better service-margin design even if Elite remains slightly faster.
-
----
+This phase should follow the single-Amphora envelope work, not precede it.
 
 # 25. Telemetry checklist
 
@@ -1679,61 +1670,57 @@ A “load balancer ceiling” is only trustworthy after these are ruled out.
 
 # 26. Prioritized engineering recommendations
 
-## P0 - Do now
+## P0 - Preserve and complete the baseline
 
 | Item | Why |
 |---|---|
-| Increase generator fleet and rerun direct + Octavia controls | Removes current 93-99% client CPU ambiguity |
-| Verify the deployed image was actually built with `-m` | Multi-vCPU results are not interpretable otherwise |
-| Record `haproxy -vv`, OpenSSL version, generated `nbthread/cpu-map` | Establishes actual software/thread state |
-| Verify virtio multiqueue maximum **and active** queues | Flavor metadata alone is insufficient |
-| Capture guest per-vCPU `mpstat`, interrupts and softirqs during load | Determines whether CPU0 is packet-path constrained |
-| Capture HAProxy runtime stats per run | Shows whether HAProxy itself is idle/connection-limited |
-| Capture host vhost/QEMU/softirq/NIC queue telemetry | Prevents moving a bottleneck from guest to host invisibly |
+| Keep `hw:vif_multiqueue_enabled=true` on the production benchmark flavors and recreate Amphorae after VIF-affecting changes | MQ is the resolved root-cause fix for the old scaling plateau |
+| Record exact queue count/IRQ state per campaign | Detects regression without pretending MQ is still an open question |
+| Keep the 16-worker / 64-process generator fleet and 10-backend topology for comparable campaigns | Current adaptive HTTP has demonstrated client headroom |
+| Keep the three-run standard matrix separate from the Elite-only concurrency diagnostic | Prevents mixed fingerprints/populations from corrupting reference medians |
+| Run current-MQ churn/CPS, active-connection-capacity, and 64K/1M bandwidth scenarios | These are the largest remaining holes in the publishable service envelope |
+| Apply explicit failure/p99/resource-warning quality gates | Prevents a high but unhealthy peak from becoming a product claim |
 
-## P1 - High-value A/B tests
+## P1 - Evidence-triggered dataplane A/B tests
+
+| Item | Trigger / purpose |
+|---|---|
+| HAProxy 2.8 listener sharding | Test if CPS/accept-path telemetry shows contention |
+| `connection_logging=false` | Test if churn/CPS is logging-cost sensitive; measure operational tradeoff |
+| Controlled IRQ/queue affinity | Use only if a current-MQ workload again shows one hot queue/CPU |
+| Selective RPS/RFS/XPS | Same trigger; compare against current MQ baseline |
+| Two-housekeeping-CPU Elite image | Defer unless current-MQ CPU0 is again proven limiting; not a default next step |
+| TLS certificate/session matrix | Converts termination/churn data into full/resumed TLS CPS limits |
+| `hw:numa_nodes=1` / network NUMA affinity | Measure premium-tier consistency/locality, especially under host contention |
+
+## P2 - Product-tier and density optimization
 
 | Item | Why |
 |---|---|
-| Two-housekeeping-CPU experimental image | Direct response to the present hot-vCPU symptom |
-| Multiqueue + controlled IRQ/queue affinity | Determines whether packet processing can scale without sacrificing all worker isolation |
-| `connection_logging=false` | Upstream Octavia explicitly says it can improve LB performance |
-| HAProxy 2.8 listener sharding | Potential high-CPS/accept-path gain available in deployed HAProxy generation |
-| `hw:numa_nodes=1` for premium flavors | Keeps small dataplane VM within one NUMA locality domain |
-| `hw:emulator_threads_policy=share` with adequate shared CPU pool | Protects paid PCPU capacity from emulator overhead |
-| TLS cert/session matrix | Converts unknown TLS cost into a sellable capacity envelope |
-
-## P2 - Product-tier optimization
-
-| Item | Why |
-|---|---|
-| Pro mixed masks 0 / 0-1 / 0-2 | Finds best PCPU margin/performance point |
-| Elite SMT `prefer` vs `isolate` | Quantifies isolation benefit versus stranded capacity |
-| Performance power profile / C-state A/B | May reduce tail latency and variance for premium tier |
-| 2 MiB hugepages A/B | Possible TLB/jitter benefit, but must justify fragmentation |
-| Selective RPS/RFS/XPS | Useful only after queue/softirq evidence supports it |
-| Host NIC RSS/IRQ remap | Important as density increases; must preserve premium PCPU isolation |
+| Pro mixed PCPU/VCPU masks | Find best margin/performance point between shared and fully dedicated CPU |
+| Elite dedicated CPU as control | Establishes the consistency ceiling against which mixed designs are judged |
+| Multi-Amphora correlated-load density campaign | Required to validate allocation ratio 4/5/6 and host-level failover reserve |
+| Performance governor/C-state A/B | Potential p99/jitter improvement for premium tier |
+| 2 MiB hugepages A/B | Possible TLB/jitter benefit only if measurable enough to justify fragmentation |
 
 ## P3 - Separate research tracks
 
 | Item | Why |
 |---|---|
-| Newer HAProxy / alternate TLS library image | Potential major TLS-CPS upside, but large support/security lifecycle decision |
-| Busy polling | Can trade CPU/power for latency; poor default for dense service |
+| Newer HAProxy / alternate TLS library image | Potential TLS-CPS upside, but separate support/security lifecycle decision |
+| Busy polling | Trades CPU/power for latency; poor dense-service default |
 | 1-GiB hugepages | High fragmentation cost for uncertain Amphora benefit |
-| SR-IOV / OVS-DPDK | Changes architecture/operational model; not required to optimize current virtio Amphora offering |
-
----
+| SR-IOV / OVS-DPDK | Architectural change; not required to validate or optimize the current virtio Amphora product |
 
 # 27. Anti-patterns to avoid
 
-## 27.1 “8 vCPU is faster than 4 vCPU because it has more cores”
+## 27.1 “Core count alone predicts the SKU performance ratio”
 
-Current data already disproves this assumption for the present path. Find the serial resource first.[^1]
+The post-MQ data proves that additional vCPUs can translate into real Amphora capacity, but not by one universal multiplier. Elite/Pro scaling differs materially by workload: ~1.63x for normal HTTP, ~1.94x for TLS passthrough, ~1.81x for TLS termination, ~1.36x for re-encryption, and ~2.12x in the clean adaptive HTTP ceiling search. Publish scenario-specific envelopes, not a generic “8 vCPU = 2x 4 vCPU” rule.
 
-## 27.2 “Multiqueue is enabled in the flavor, therefore traffic is multiqueued”
+## 27.2 “The flavor property is enough evidence that MQ is healthy”
 
-Nova explicitly requires guest activation. Then IRQ distribution still needs verification.[^3]
+The current baseline is MQ-enabled and the 4-vCPU Pro guest was directly verified with four active combined queues and distributed virtio IRQ/NET_RX work. Keep checking `ethtool -l`, queue counters, and IRQ affinity because regressions are possible; do not revert the document to treating MQ enablement itself as unresolved.[^3]
 
 ## 27.3 “Spread all IRQs across all CPUs”
 
@@ -1767,104 +1754,121 @@ The standby is a resiliency resource, not normal active dataplane capacity. Capa
 
 # 28. Recommended immediate next run
 
-Given the evidence available today, the best next run is intentionally narrow.
+The immediate next campaign should **not** add generators, re-prove basic multiqueue enablement, or jump directly to a two-housekeeping-CPU image. Those questions were either resolved or intentionally deferred.
 
-## Step 1: remove generator ambiguity
+The next run should complete the current-MQ reference envelope using the existing 16-worker / 64-process generator fleet and 10-backend topology.
 
-Increase the current 4 generator VMs to 8 while keeping the same VM flavor and roughly one Locust worker process per vCPU.[^1]
+## Step 1: run the missing current-MQ scenario families
 
-Do not change:
+Start with three repetitions per flavor for:
+
+```text
+http_1k_connection_churn
+tls_termination_1k_connection_churn
+http_max_connections_active
+tls_termination_max_connections_active
+http_64k_keepalive
+http_1m_keepalive
+tls_termination_64k_keepalive
+```
+
+Then add the passthrough and re-encryption active-connection variants where product relevance justifies the campaign:
+
+```text
+tls_passthrough_max_connections_active
+tls_termination_reencrypt_max_connections_active
+```
+
+Keep constant:
 
 ```text
 Amphora image
-Octavia flavor
-backend count
-payload
+MQ-enabled flavor definitions
+backend fleet
+generator fleet
 traffic path
 generator network mode
-HTTP keepalive semantics
 logging state
+HAProxy template/reuse behavior
+certificate material for like-for-like TLS comparisons
 ```
 
-Run:
+## Step 2: quality-gate each dimension with the metric that actually matters
+
+For churn/CPS:
 
 ```text
-direct nginx control
-4-vCPU Pro http_1k_max_rps
-8-vCPU Elite http_1k_max_rps
+successful requests/connections per second
+failures
+p95/p99
+generator CPU
+HAProxy ConnRate/SessRate
 ```
 
-## Step 2: collect synchronized guest telemetry
+For connection capacity:
 
-During the accepted high-load step:
+```text
+maximum sustainable active connections
+establishment failures
+survival failures
+establishment p99
+source-port/FD headroom
+HAProxy CurrConns
+```
+
+For bandwidth:
+
+```text
+payload Gbit/s
+RPS
+p99
+PPS
+guest + host NIC drops
+backend/network CPU
+```
+
+Do not substitute the 1-KiB `estimated_peak_payload_gbps` values for a dedicated bandwidth ceiling.
+
+## Step 3: collect synchronized telemetry at the limiting level
+
+At the last clean level and first failing/degrading level, capture:
 
 ```bash
 mpstat -P ALL 1
 cat /proc/interrupts
 cat /proc/softirqs
-
-for nic in $(ls /sys/class/net | grep -v '^lo$'); do
-  ethtool -l "$nic"
-  ethtool -S "$nic" 2>/dev/null
-  ethtool -k "$nic"
-done
-
-ps -eLo pid,tid,psr,pcpu,comm,args --sort=-pcpu | head -100
-
-haproxy -vv
+ethtool -l <dataplane-nic>
+ethtool -S <dataplane-nic>
+ps -eLo pid,tid,psr,pcpu,comm,args --sort=-pcpu
+ss -s
+nstat
 ```
 
-and query HAProxy runtime stats at one-second or low-frequency intervals that do not materially disturb the run.
+plus HAProxy runtime stats and host QEMU/vhost/NIC/OVN telemetry.
 
-## Step 3: decide the next branch from evidence
+## Step 4: choose the next engineering branch from the new limiter
 
-### Result A
+### If churn/TLS CPS is accept-path limited
 
-```text
-Octavia still ~58k
-Direct >> 58k
-CPU0 ~100% softirq/IRQ
-HAProxy worker CPUs have headroom
-```
+Test listener sharding and logging as isolated A/B changes.
 
-**Next:** multiqueue/IRQ/housekeeping campaign.
+### If CPU0 becomes IRQ/softirq-bound again despite MQ
 
-### Result B
+Test controlled queue/IRQ placement first. Only then consider selective RPS/RFS/XPS or the deferred two-housekeeping-CPU Elite image.
 
-```text
-Octavia still ~58k
-Direct >> 58k
-CPU0 HAProxy user CPU high
-```
+### If TLS worker CPU dominates
 
-**Next:** inspect generated `cpu-map`, thread assignment, listener sharding, and any serial HAProxy path.
+Run the certificate/session matrix and profile the supported HAProxy/OpenSSL stack.
 
-### Result C
+### If bandwidth reaches host/NIC limits
 
-```text
-Octavia climbs materially above 58k
-Generator CPU now healthy
-```
+Move the investigation to host RSS/IRQ, NUMA, vhost/QEMU placement, drops, rings, and offloads.
 
-**Next:** previous ceiling was partly generator-limited; establish the new true Amphora ceiling before tuning.
+### If the generator becomes hot
 
-### Result D
+Treat that specific scenario as generator-limited and add client capacity for that scenario. Do not generalize the warning back to the already-clean adaptive HTTP dataset.
 
-```text
-Direct remains near Octavia and generators are still hot
-```
-
-**Next:** increase generator capacity again. Do not touch Amphora yet.
-
-### Result E
-
-```text
-host vhost/softirq/NIC/OVN saturates before guest
-```
-
-**Next:** host dataplane tuning and density-pool design, not guest HAProxy tuning.
-
----
+The desired output of this campaign is the first complete current-MQ flavor envelope covering **RPS, TLS behavior, CPS, simultaneous connections, bandwidth, and tail latency**.
 
 # 29. What success should look like
 
@@ -1905,31 +1909,40 @@ That is the metric that aligns HAProxy tuning, Nova placement, host networking, 
 
 # 30. Final assessment
 
-The current evidence does not suggest that Amphora or HAProxy has reached an inherent architectural ceiling at roughly 58k HTTP RPS. It suggests that the system has reached a **specific serial dataplane ceiling** before the additional 8-vCPU worker capacity can be exploited.
+The investigation has materially changed since the original ~58k Pro/Elite plateau. The old result was not an inherent HAProxy or 8-vCPU Amphora ceiling. It was a configuration-dependent dataplane ceiling strongly explained by the single-queue virtio path and its concentration of NET_RX work on CPU0.
 
-The strongest candidate is the intentional one-housekeeping-CPU design interacting with virtio/IRQ/softirq processing, but the hot generator fleet means that must still be proven. The right engineering response is therefore a synchronized packet-path investigation, not more flavor inflation.
+That root cause is now substantially resolved:
 
-The most promising opportunities are, in order:
+- multiqueue is enabled on the benchmark Amphora flavors;
+- the 4-vCPU Pro dataplane was directly observed with four active combined queues;
+- virtio queue IRQs and NET_RX processing were distributed across CPUs instead of remaining concentrated on CPU0;
+- Elite HAProxy worker threads were observed mapped across CPUs1-7;
+- the clean adaptive Elite HTTP median is ~127.8k sustainable RPS with no failures or generator-limit warnings;
+- the homogeneous normal HTTP matrix median is ~93.2k RPS;
+- the separate Elite concurrency diagnostic peaks at 126.7k RPS and shows saturation around 750-1500 users before latency grows and throughput falls;
+- the normal TLS matrix now characterizes passthrough, frontend termination, and re-encryption request-rate behavior.
 
-1. remove generator limitations;
-2. prove what consumes vCPU0;
-3. verify multiqueue is both exposed and active;
-4. measure per-queue IRQ/softirq concentration;
-5. test a two-housekeeping-CPU image if CPU0 is the confirmed limiter;
-6. test controlled queue steering as an alternative;
-7. A/B HAProxy 2.8 listener sharding for CPS-heavy workloads;
-8. disable connection logging as a measured product/operations tradeoff;
-9. characterize TLS separately, including the Noble/OpenSSL 3 stack;
-10. validate NUMA/NIC/QEMU/vhost locality on premium hosts;
-11. only then use multi-Amphora correlated-load campaigns to set Standard ratio 4/5/6 and Pro/Elite isolation policy.
+The main engineering gap is therefore no longer “why do 4 and 8 vCPUs both stop near 58k?” It is:
 
-This sequence keeps the work focused on improving the existing Amphora offering while preserving the commercial objective: predictable customer performance with enough safe density to make a dedicated Octavia cluster economically efficient.
+> **What are the current-MQ limits for connection churn/TLS CPS, simultaneous connections, bandwidth/PPS, and multi-Amphora host density, and which resource limits each one?**
 
----
+The priority order is now:
+
+1. preserve the known-good MQ baseline and prevent regression;
+2. complete the current-MQ CPS/churn, active-connection, and bandwidth envelopes;
+3. capture synchronized guest/host/generator telemetry at each new ceiling;
+4. use listener sharding/logging only if CPS/accept telemetry justifies it;
+5. use queue steering or a second housekeeping CPU only if a current-MQ workload again proves CPU0/IRQ/softirq serialization;
+6. characterize full/resumed TLS handshakes and certificate cost;
+7. validate NUMA/vhost/NIC locality and premium-tier consistency;
+8. run correlated multi-Amphora density tests before setting shared-VCPU ratios or host caps;
+9. compare Pro mixed-CPU designs against Elite dedicated CPU on performance-per-physical-core and p99 consistency.
+
+This keeps the engineering program aligned with the commercial objective: publish defensible scenario-specific capacity envelopes while maximizing safe host density. The multiqueue fix is now part of the baseline, not an item on the unresolved-investigation list.
 
 # Sources
 
-[^1]: Internal engineering artifact, `OCTAVIA_HTTP_MAX_RPS_FINDINGS_AND_NEXT_RUN.md`, September 11, 2026. Current Pro/Elite max-RPS results, generator CPU caveat, per-vCPU and packet-rate observations.
+[^1]: Internal engineering artifact, `OCTAVIA_HTTP_MAX_RPS_FINDINGS_AND_NEXT_RUN.md`, September 11, 2026. Historical pre-MQ Pro/Elite max-RPS results, generator caveat, and per-vCPU/packet-rate observations; retained here as the pre-fix baseline rather than the current ceiling.
 
 [^2]: OpenStack Octavia, “2023.1 Series Release Notes,” CPU-pinning element and Amphora worker pinning. https://docs.openstack.org/releasenotes/octavia/2023.1.html
 
