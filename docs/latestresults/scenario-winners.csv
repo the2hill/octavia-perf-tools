@@ -1,0 +1,5 @@
+scenario_name,traffic_path,generator_network_mode,primary_metric,primary_unit,winner_flavor,winner_value,runner_up_flavor,runner_up_value,winner_margin_percent,population_fingerprint_count
+http_1k_keepalive,tenant_vip,shared,peak_rps_history,requests/s,lb.elite_experimental,93180.9,lb.pro_experimental,57308.5,62.59525201322664,2
+tls_passthrough_1k_keepalive,tenant_vip,shared,peak_rps_history,requests/s,lb.elite_experimental,140974.8,lb.pro_experimental,72766.0,93.73718494901465,1
+tls_termination_1k_keepalive,tenant_vip,shared,peak_rps_history,requests/s,lb.elite_experimental,73892.3,lb.pro_experimental,40778.8,81.20273279252945,1
+tls_termination_reencrypt_1k_keepalive,tenant_vip,shared,peak_rps_history,requests/s,lb.elite_experimental,64592.0,lb.pro_experimental,47634.1,35.600336733558535,1
