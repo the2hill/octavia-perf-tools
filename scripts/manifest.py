@@ -573,7 +573,24 @@ def build_manifest(result_dir: Path) -> dict[str, Any]:
         "backend": manifest["backend"],
         "workload": manifest["workload"],
         "scenario": manifest["scenario"],
-        "octavia_protocol": {k: v for k, v in manifest["octavia"].items() if k not in {"flavor_under_test", "provider"}},
+        # Keep protocol/tuning controls in the compatibility fingerprint, but
+        # exclude flavor/runtime Amphora identity. Different flavor candidates
+        # necessarily produce different Amphora UUIDs, Nova instance names, and
+        # Prometheus domain selectors; those are provenance, not test drift.
+        "octavia_protocol": {
+            k: v
+            for k, v in manifest["octavia"].items()
+            if k
+            not in {
+                "flavor_under_test",
+                "provider",
+                "amphora_inventory_captured_at_utc",
+                "amphorae",
+                "primary_amphora",
+                "prometheus_libvirt_domains",
+                "prometheus_libvirt_domain_regex",
+            }
+        },
         "tls": {
             k: v
             for k, v in manifest["tls"].items()

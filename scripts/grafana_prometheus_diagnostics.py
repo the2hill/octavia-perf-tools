@@ -190,8 +190,13 @@ def max_series_stat(metrics: dict[str, Any], name: str, stat_name: str = "max") 
     return max(values) if values else None
 
 
+def promql_string(value: str) -> str:
+    """Escape a value for use inside a double-quoted PromQL string."""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def build_queries(domain_regex: str, rate_window_seconds: int) -> dict[str, str]:
-    selector = f'domain=~"{domain_regex}"'
+    selector = f'domain=~"{promql_string(domain_regex)}"'
     window = f"{rate_window_seconds}s"
     cpu = f'rate(libvirt_domain_vcpu_time_seconds_total{{{selector}}}[{window}])'
     delay = f'rate(libvirt_domain_vcpu_delay_seconds_total{{{selector}}}[{window}])'

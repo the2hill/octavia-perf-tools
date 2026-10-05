@@ -37,12 +37,10 @@ def record_error(data: dict[str, Any], key: str, exc: Exception) -> None:
 
 
 def status_tree(conn: Any, lb_id: str) -> Any:
-    # openstacksdk does not expose this Octavia endpoint as a first-class helper.
-    # The proxy session is a keystoneauth Adapter, so a service-relative path is
-    # preferred and keeps catalog/interface/region selection intact.
-    response = conn.load_balancer._session.get(  # noqa: SLF001 - intentional SDK adapter use
-        f"/lbaas/loadbalancers/{lb_id}/status"
-    )
+    # openstacksdk service proxies are keystoneauth Adapter subclasses, so the
+    # public request methods live directly on the proxy. Do not reach through a
+    # private _session attribute: current Proxy objects do not expose it.
+    response = conn.load_balancer.get(f"/lbaas/loadbalancers/{lb_id}/status")
     response.raise_for_status()
     return response.json()
 
