@@ -10,35 +10,8 @@ metadata:
   notes: null
 
 openstack:
-  # Tenant/project identity used for provisioning and benchmark operations.
-  # This is a complete openstacksdk/Ansible cloud configuration; no clouds.yaml
-  # entry is required. Replace the placeholders in config/local.yml only.
-  cloud:
-    auth_type: password
-    auth:
-      auth_url: https://identity.example.com/v3
-      username: benchmark-tenant-user
-      password: CHANGE_ME
-      project_name: benchmark-project
-      user_domain_name: Default
-      project_domain_name: Default
-    interface: public
-    verify: true
-
-  # Operator/admin identity used only for Amphora inventory and backing
-  # Nova/Neutron diagnostics. Keep it distinct from the benchmark tenant.
-  admin_cloud:
-    auth_type: password
-    auth:
-      auth_url: https://identity.example.com/v3
-      username: benchmark-operator-user
-      password: CHANGE_ME
-      project_name: admin
-      user_domain_name: Default
-      project_domain_name: Default
-    interface: public
-    verify: true
-
+  # Name of a cloud in ~/.config/openstack/clouds.yaml (preferred) or OS_CLOUD.
+  cloud: sjc3
   region_name: SJC3
   # Free-form label recorded in every run manifest; it is documentation only.
   environment_label: api.sjc3.rackspacecloud.com
@@ -87,16 +60,9 @@ ssh:
   # flooded with simultaneous ProxyJump handshakes.
   connect_timeout_seconds: 10
   readiness_timeout_seconds: 600
-  private_tcp_timeout_seconds: 180
   readiness_serial: 2
   configure_serial: 4
   retries: 5
-  # The Ansible controller may itself live on a jumbo tenant network while the
-  # OpenStack external/FIP network is 1500. Automatically install a temporary
-  # /32 route for the current master FIP using the external network MTU, then
-  # restore the previous route during destroy. Requires sudo on the controller.
-  manage_controller_fip_route: true
-  controller_fip_mtu: auto
   # Set this to the public CIDR from which you will run Ansible, normally /32.
   operator_cidr: 203.0.113.10/32
 
@@ -158,14 +124,16 @@ benchmark:
   traffic_path: tenant_vip
 
 locust:
-  # Concurrency staircase. duration_seconds is time spent at that level, not cumulative.
+  # Reference regression staircase: 210 seconds of steady load per run.
+  # duration_seconds is time spent at that level, not cumulative.
+  # The older 465-second/8000-user staircase is intentionally shortened because
+  # the useful keepalive throughput plateau is reached well below 8000 users.
   stages:
-    - { users: 250,  duration_seconds: 45,  spawn_rate: 250 }
-    - { users: 500,  duration_seconds: 60,  spawn_rate: 250 }
-    - { users: 1000, duration_seconds: 60,  spawn_rate: 500 }
-    - { users: 2000, duration_seconds: 90,  spawn_rate: 500 }
-    - { users: 4000, duration_seconds: 90,  spawn_rate: 1000 }
-    - { users: 8000, duration_seconds: 120, spawn_rate: 1000 }
+    - { users: 250,  duration_seconds: 30, spawn_rate: 500 }
+    - { users: 500,  duration_seconds: 30, spawn_rate: 1000 }
+    - { users: 1000, duration_seconds: 45, spawn_rate: 2000 }
+    - { users: 2000, duration_seconds: 45, spawn_rate: 2000 }
+    - { users: 4000, duration_seconds: 60, spawn_rate: 4000 }
   request_timeout_seconds: 10
   stop_timeout_seconds: 20
   baseline_direct: true
@@ -622,30 +590,10 @@ campaign:
   baseline_repetitions: 1
   randomize_run_order: true
   cooldown_seconds: 15
-  # Ordinary benchmark.py invocations remain fail-fast unless --continue-on-error
-  # is supplied. The baseline runbook enables continue-on-error and defaults to
-  # three LB provisioning attempts so a transient Octavia build failure does not
-  # terminate an otherwise useful campaign.
-  lb_create_attempts: 3
-  lb_create_retry_delay_seconds: 30
 
 metrics:
   sample_interval_seconds: 1
   cpu_warn_percent: 85
-
-# Optional historical Amphora metrics collection through Grafana. Grafana remains
-# the only externally reachable endpoint; it proxies these requests to its internal
-# Prometheus/Thanos datasource. Keep the service-account token out of this file.
-grafana:
-  enabled: false
-  url: https://grafana.example.com
-  prometheus_datasource_uid: prometheus
-  token_env: GRAFANA_TOKEN
-  verify_tls: true
-  ca_file: null
-  timeout_seconds: 30
-  step_seconds: 15
-  rate_window_seconds: 60
 
 # Test these Octavia flavors serially. Use "default" to omit a flavor request and
 # measure the cloud's default. Replace/add names that exist in your environment.
@@ -653,12 +601,10 @@ octavia:
   flavors:
     - default
   lb_algorithm: ROUND_ROBIN
-  # Keep request-rate/CPS listener policy comfortably above the normal workload
-  # without using an unnecessarily huge maxconn for every test. Connection-capacity
-  # scenarios use capacity_connection_limit instead.
+  # Keep benchmark policy limits above the workload so a configured listener cap
+  # or idle timeout is not mistaken for the Octavia flavor's resource ceiling.
   listener:
-    connection_limit: 100000
-    capacity_connection_limit: 1000000
+    connection_limit: 1000000
     timeout_client_data_ms: 300000
     timeout_member_data_ms: 300000
   health_monitor:
@@ -666,4 +612,3 @@ octavia:
     timeout: 3
     max_retries: 3
     max_retries_down: 3
-

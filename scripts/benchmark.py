@@ -12,8 +12,6 @@ from typing import Any
 
 import yaml
 
-from openstack_auth import connect as openstack_connect
-
 from topology import direct_backend_reachable, resolved_generator_network_mode
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -281,15 +279,6 @@ def one_run(
         (result_dir / "timing.yml").write_text(yaml.safe_dump(timing, sort_keys=False))
         stage = "collect"
         ansible("playbooks/collect.yml", config, **common)
-        stage = "grafana_prometheus_diagnostics"
-        run(
-            str(PYTHON),
-            "scripts/grafana_prometheus_diagnostics.py",
-            "--config",
-            str(config),
-            "--result-dir",
-            str(result_dir),
-        )
         stage = "manifest"
         run(str(PYTHON), "scripts/manifest.py", str(result_dir))
         stage = "report"
@@ -323,6 +312,112 @@ def one_run(
     return result_dir
 
 
+
+def update_current_target_for_run(
+    *,
+    benchmark_id: str,
+    suite_id: str,
+    campaign_id: str,
+) -> None:
+    """Retarget an already-configured persistent-LB scenario to a new repetition ID."""
+    path = ROOT / "state" / "current_target.yml"
+    if not path.exists():
+        raise RuntimeError(
+            "state/current_target.yml is missing; persistent scenario must be configured before repetitions run"
+        )
+
+    target = yaml.safe_load(path.read_text()) or {}
+    if not isinstance(target, dict):
+        raise RuntimeError("state/current_target.yml does not contain a mapping")
+
+    target["benchmark_id"] = benchmark_id
+    target["suite_id"] = suite_id
+    target["campaign_id"] = campaign_id
+    path.write_text(yaml.safe_dump(target, sort_keys=False), encoding="utf-8")
+
+
+def run_preconfigured_campaign_rep(
+    config: pathlib.Path,
+    flavor: str,
+    scenario_name: str,
+    repetition: int,
+    *,
+    campaign_id: str,
+    suite_id: str,
+) -> pathlib.Path:
+    """Run one repetition against scenario resources that already exist on the campaign LB."""
+    orchestration_started = dt.datetime.now(dt.timezone.utc)
+    stamp = orchestration_started.strftime("%Y%m%dT%H%M%SZ")
+    bench_id = f"{stamp}-{slug(scenario_name)}-{slug(flavor)}-octavia-r{repetition:02d}"
+    result_dir = ROOT / "results" / bench_id
+    result_dir.mkdir(parents=True, exist_ok=False)
+
+    common = {
+        "octavia_flavor": flavor,
+        "scenario_name": scenario_name,
+        "benchmark_id": bench_id,
+        "campaign_id": campaign_id,
+        "suite_id": suite_id,
+    }
+
+    stage = "retarget_preconfigured_scenario"
+    try:
+        update_current_target_for_run(
+            benchmark_id=bench_id,
+            suite_id=suite_id,
+            campaign_id=campaign_id,
+        )
+
+        print(
+            f"Running preconfigured campaign scenario {scenario_name} "
+            f"for flavor {flavor} r{repetition:02d}",
+            flush=True,
+        )
+
+        stage = "run_test"
+        load_started = dt.datetime.now(dt.timezone.utc)
+        ansible("playbooks/run_test.yml", config, **common)
+        load_completed = dt.datetime.now(dt.timezone.utc)
+        timing = {
+            "orchestration_started_at_utc": orchestration_started.replace(microsecond=0).isoformat(),
+            "load_test_started_at_utc": load_started.replace(microsecond=0).isoformat(),
+            "load_test_completed_at_utc": load_completed.replace(microsecond=0).isoformat(),
+            "load_test_elapsed_seconds": round((load_completed - load_started).total_seconds(), 3),
+        }
+        (result_dir / "timing.yml").write_text(
+            yaml.safe_dump(timing, sort_keys=False), encoding="utf-8"
+        )
+
+        stage = "collect"
+        ansible("playbooks/collect.yml", config, **common)
+        stage = "manifest"
+        run(str(PYTHON), "scripts/manifest.py", str(result_dir))
+        stage = "report"
+        run(str(PYTHON), "scripts/report.py", str(result_dir))
+    except subprocess.CalledProcessError as exc:
+        write_run_failure(result_dir, stage=stage, exc=exc)
+        try:
+            collect_lb_failure_diagnostics(
+                config,
+                lb_name=campaign_lb_name(config, flavor, campaign_id),
+                attempt=1,
+                result_dir=result_dir,
+            )
+        except Exception as diag_exc:
+            print(f"WARNING: persistent LB diagnostics failed: {diag_exc}", flush=True)
+        raise
+
+    return result_dir
+
+
+def scenario_setup_result_dir(campaign_id: str, flavor: str, scenario_name: str) -> pathlib.Path:
+    return (
+        ROOT
+        / "results"
+        / f"{slug(campaign_id)}-{slug(flavor)}-{slug(scenario_name)}-scenario-setup"
+    )
+
+
 def cfg_run_prefix(config: pathlib.Path) -> str:
     cfg = yaml.safe_load(config.read_text()) or {}
     return str(cfg.get("run_prefix") or "octavia-perf")
@@ -338,14 +433,24 @@ def resolve_octavia_flavor(config: pathlib.Path, flavor: str) -> dict[str, Any] 
     if flavor == "default":
         return None
 
+    try:
+        import openstack
+    except ImportError as exc:
+        raise RuntimeError(
+            "openstacksdk is required to resolve the Octavia flavor; run make bootstrap"
+        ) from exc
+
     cfg = yaml.safe_load(config.read_text()) or {}
     cloud_cfg = cfg.get("openstack") or {}
     cloud = cloud_cfg.get("cloud")
     if not cloud:
         raise RuntimeError("openstack.cloud is required to resolve the Octavia flavor")
 
+    connect_args: dict[str, Any] = {"cloud": cloud}
     region = cloud_cfg.get("region_name")
-    conn = openstack_connect(cloud, str(region) if region else None)
+    if region:
+        connect_args["region_name"] = region
+    conn = openstack.connect(**connect_args)
     obj = conn.load_balancer.find_flavor(flavor, ignore_missing=True)
     if obj is None:
         raise RuntimeError(f"Octavia flavor {flavor!r} was not found")
@@ -784,21 +889,11 @@ def main() -> None:
                     execute_run("baseline", scenario_name, "direct", rep)
 
     if args.direct_baselines_only:
-        schedule: list[tuple[str, str, int]] = []
         print(
             "\nDirect-control-only mode complete; skipping Octavia load-balancer runs.",
             flush=True,
         )
     else:
-        schedule = [
-            (flavor, scenario_name, rep)
-            for rep in range(1, repetitions + 1)
-            for flavor in flavors
-            for scenario_name in scenario_names
-        ]
-        if campaign.get("randomize_run_order", campaign.get("randomize_flavor_order", True)):
-            random.shuffle(schedule)
-
         try:
             if args.reuse_load_balancer:
                 print(
@@ -806,9 +901,15 @@ def main() -> None:
                     flush=True,
                 )
                 print(
-                    "  One LB/amphora will be created per flavor and reused across every selected scenario/repetition.",
+                    "  One LB/amphora will be created per flavor.",
                     flush=True,
                 )
+                print(
+                    "  Each flavor/scenario is configured once, all repetitions run against "
+                    "those same child resources, then the scenario is cleaned up once.",
+                    flush=True,
+                )
+
                 for flavor in flavors:
                     try:
                         prepare_campaign_lb(
@@ -821,13 +922,22 @@ def main() -> None:
                         prepared_campaign_flavors.add(flavor)
                     except subprocess.CalledProcessError as exc:
                         failure = {
-                            "failed_at_utc": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat(),
+                            "failed_at_utc": dt.datetime.now(dt.timezone.utc)
+                            .replace(microsecond=0)
+                            .isoformat(),
                             "target_kind": "octavia_campaign_lb",
                             "flavor": flavor,
                             "scenario": None,
                             "repetition": None,
                             "returncode": exc.returncode,
-                            "command": [str(x) for x in (exc.cmd if isinstance(exc.cmd, (list, tuple)) else [exc.cmd])],
+                            "command": [
+                                str(x)
+                                for x in (
+                                    exc.cmd
+                                    if isinstance(exc.cmd, (list, tuple))
+                                    else [exc.cmd]
+                                )
+                            ],
                         }
                         failures.append(failure)
                         if not args.continue_on_error:
@@ -856,11 +966,187 @@ def main() -> None:
                     )
                     input("Press Enter to start the Octavia benchmark scenarios... ")
 
-            for flavor, scenario_name, rep in schedule:
-                if args.reuse_load_balancer and flavor not in prepared_campaign_flavors:
-                    continue
-                cool_down()
-                execute_run(flavor, scenario_name, "octavia", rep)
+                scenario_schedule = [
+                    (flavor, scenario_name)
+                    for flavor in flavors
+                    for scenario_name in scenario_names
+                    if flavor in prepared_campaign_flavors
+                ]
+                if campaign.get(
+                    "randomize_run_order",
+                    campaign.get("randomize_flavor_order", True),
+                ):
+                    # Repetitions must remain contiguous so scenario resources can be reused.
+                    # Randomize flavor/scenario groups instead of individual repetitions.
+                    random.shuffle(scenario_schedule)
+
+                for flavor, scenario_name in scenario_schedule:
+                    setup_dir = scenario_setup_result_dir(
+                        campaign_id, flavor, scenario_name
+                    )
+                    setup_dir.mkdir(parents=True, exist_ok=True)
+                    setup_benchmark_id = setup_dir.name
+                    setup_common = {
+                        "octavia_flavor": flavor,
+                        "scenario_name": scenario_name,
+                        "benchmark_id": setup_benchmark_id,
+                        "campaign_id": campaign_id,
+                        "suite_id": campaign_id,
+                    }
+                    scenario_configured = False
+
+                    print(
+                        "\nCONFIGURE SCENARIO ONCE: "
+                        f"flavor={flavor} scenario={scenario_name} repetitions={repetitions}",
+                        flush=True,
+                    )
+                    try:
+                        try:
+                            ansible(
+                                "playbooks/configure_campaign_lb_scenario.yml",
+                                config,
+                                **setup_common,
+                            )
+                            scenario_configured = True
+                        except subprocess.CalledProcessError as exc:
+                            write_run_failure(
+                                setup_dir,
+                                stage="configure_campaign_lb_scenario",
+                                exc=exc,
+                            )
+                            try:
+                                collect_lb_failure_diagnostics(
+                                    config,
+                                    lb_name=campaign_lb_name(
+                                        config, flavor, campaign_id
+                                    ),
+                                    attempt=1,
+                                    result_dir=setup_dir,
+                                )
+                            except Exception as diag_exc:
+                                print(
+                                    f"WARNING: persistent LB diagnostics failed: {diag_exc}",
+                                    flush=True,
+                                )
+                            failure = {
+                                "failed_at_utc": dt.datetime.now(dt.timezone.utc)
+                                .replace(microsecond=0)
+                                .isoformat(),
+                                "target_kind": "octavia_scenario_setup",
+                                "flavor": flavor,
+                                "scenario": scenario_name,
+                                "repetition": None,
+                                "returncode": exc.returncode,
+                                "command": [
+                                    str(x)
+                                    for x in (
+                                        exc.cmd
+                                        if isinstance(exc.cmd, (list, tuple))
+                                        else [exc.cmd]
+                                    )
+                                ],
+                            }
+                            failures.append(failure)
+                            print(
+                                "\nFAILED SCENARIO SETUP: "
+                                f"flavor={flavor} scenario={scenario_name} "
+                                f"rc={exc.returncode}",
+                                flush=True,
+                            )
+                            if not args.continue_on_error:
+                                raise
+                            print(
+                                "Skipping repetitions for this flavor/scenario and "
+                                "continuing with the campaign.",
+                                flush=True,
+                            )
+
+                        if scenario_configured:
+                            for rep in range(1, repetitions + 1):
+                                cool_down()
+                                try:
+                                    outputs.append(
+                                        run_preconfigured_campaign_rep(
+                                            config,
+                                            flavor,
+                                            scenario_name,
+                                            rep,
+                                            campaign_id=campaign_id,
+                                            suite_id=campaign_id,
+                                        )
+                                    )
+                                except subprocess.CalledProcessError as exc:
+                                    failure = {
+                                        "failed_at_utc": dt.datetime.now(dt.timezone.utc)
+                                        .replace(microsecond=0)
+                                        .isoformat(),
+                                        "target_kind": "octavia",
+                                        "flavor": flavor,
+                                        "scenario": scenario_name,
+                                        "repetition": rep,
+                                        "returncode": exc.returncode,
+                                        "command": [
+                                            str(x)
+                                            for x in (
+                                                exc.cmd
+                                                if isinstance(exc.cmd, (list, tuple))
+                                                else [exc.cmd]
+                                            )
+                                        ],
+                                    }
+                                    failures.append(failure)
+                                    print(
+                                        "\nFAILED RUN: "
+                                        f"target=octavia flavor={flavor} "
+                                        f"scenario={scenario_name} r{rep:02d} "
+                                        f"rc={exc.returncode}",
+                                        flush=True,
+                                    )
+                                    if not args.continue_on_error:
+                                        raise
+                                    print(
+                                        "Keeping the configured scenario and continuing "
+                                        "with the remaining repetitions.",
+                                        flush=True,
+                                    )
+                    finally:
+                        # Always attempt one scenario cleanup, even when configuration only
+                        # partially completed. The playbook is intentionally idempotent and
+                        # uses failed_when=false for absent child resources.
+                        print(
+                            "CLEAN UP SCENARIO ONCE: "
+                            f"flavor={flavor} scenario={scenario_name}",
+                            flush=True,
+                        )
+                        try:
+                            ansible(
+                                "playbooks/destroy_campaign_lb_scenario.yml",
+                                config,
+                                **setup_common,
+                            )
+                        except subprocess.CalledProcessError as cleanup_exc:
+                            print(
+                                "WARNING: final scenario cleanup failed "
+                                f"for flavor={flavor} scenario={scenario_name} "
+                                f"(rc={cleanup_exc.returncode}).",
+                                flush=True,
+                            )
+            else:
+                schedule = [
+                    (flavor, scenario_name, rep)
+                    for rep in range(1, repetitions + 1)
+                    for flavor in flavors
+                    for scenario_name in scenario_names
+                ]
+                if campaign.get(
+                    "randomize_run_order",
+                    campaign.get("randomize_flavor_order", True),
+                ):
+                    random.shuffle(schedule)
+
+                for flavor, scenario_name, rep in schedule:
+                    cool_down()
+                    execute_run(flavor, scenario_name, "octavia", rep)
         finally:
             if args.reuse_load_balancer:
                 print("\nCleaning up persistent campaign load balancer(s)...", flush=True)
@@ -901,4 +1187,3 @@ if __name__ == "__main__":
         main()
     except subprocess.CalledProcessError as exc:
         raise SystemExit(exc.returncode) from exc
-
