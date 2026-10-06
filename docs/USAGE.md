@@ -9,14 +9,31 @@ cp config/example.yml config/local.yml
 At minimum set:
 
 - `openstack.cloud`
-- `openstack.admin_cloud`
-- `openstack.region_name`
 - `network.external_network`
 - `ssh.operator_cidr`
 - `vm.image`
 - `octavia.flavors`
 
-Credentials stay in `clouds.yaml`. `openstack.cloud` is the tenant benchmark profile; `openstack.admin_cloud` is a separate operator profile used only for Amphora/Nova/Neutron inventory and failure diagnostics.
+`openstack.cloud` is the name of a tenant/project profile under `clouds:` in `~/.config/openstack/clouds.yaml`. `openstack.admin_cloud` is optional and is only used for Amphora/Nova inventory enrichment and operator-only diagnostics. `openstack.region_name` is also optional; omit it or set it to `null` to use the region selected by the named cloud profile.
+
+Example operator configuration:
+
+```yaml
+openstack:
+  cloud: rxt-dfw
+  admin_cloud: rst-dfw-admin
+  region_name: null
+```
+
+Example non-admin configuration:
+
+```yaml
+openstack:
+  cloud: rxt-dfw
+  admin_cloud: null
+```
+
+Credentials stay in `clouds.yaml`; do not embed usernames, passwords, application credentials, or tokens in `config/local.yml`.
 
 ## 2. Bootstrap and validate
 
@@ -122,6 +139,22 @@ FLAVOR=my-experimental-flavor \
 ```
 
 The runbook pauses only after the persistent LB/amphora is successfully provisioned and prints that the flavor can be disabled. Disable the flavor, then press Enter; subsequent scenarios reuse the existing LB and do not create another Amphora.
+
+## Reference characterization staircase
+
+The standard reported characterization runs use this fixed Locust staircase:
+
+```yaml
+locust:
+  stages:
+    - { users: 250,  duration_seconds: 30, spawn_rate: 500 }
+    - { users: 500,  duration_seconds: 30, spawn_rate: 1000 }
+    - { users: 1000, duration_seconds: 45, spawn_rate: 2000 }
+    - { users: 2000, duration_seconds: 45, spawn_rate: 2000 }
+    - { users: 4000, duration_seconds: 60, spawn_rate: 4000 }
+```
+
+That is 210 seconds of steady load per run. The default three repetitions are the baseline used for reported HTTP/TLS characterization results. Keep this staircase unchanged when comparing flavors. Adaptive `*_max_rps` and `*_max_connections_active` scenarios use separate search/capacity profiles and should not be compared as though they used this fixed staircase.
 
 ## Find maximum sustainable RPS
 
@@ -621,15 +654,15 @@ Before persistent-LB creation, `benchmark.py` resolves the requested Octavia fla
 
 For combined reports, new direct controls are associated with their matching `baseline_for_flavor`. Direct controls created before this provenance change appear as `legacy_unscoped`; they are retained for context but are not silently assigned to a flavor-specific Octavia-to-direct ratio.
 
-## Amphora identity and historical Prometheus correlation
+## Optional Amphora identity and historical Prometheus correlation
 
-Persistent-LB creation captures Amphora and Nova identity before benchmark traffic starts. The capture uses `openstack.admin_cloud` because the Octavia Amphora inventory API is admin-only; normal LB provisioning and test operations continue to use the tenant `openstack.cloud`. During a live campaign use:
+Persistent-LB creation always records the campaign LB/VIP/flavor state. When `openstack.admin_cloud` is configured, it additionally captures Amphora and Nova identity before benchmark traffic starts. During a live campaign use:
 
 ```bash
 cat state/current_campaign_lbs.yml
 ```
 
-The registry supports one or several simultaneously prepared flavors. Each entry includes `load_balancer_id`, `octavia_flavor`, the full `amphorae` list, `primary_amphora`, and `prometheus_libvirt_domains`. For a single/standalone Amphora the convenience fields propagated to each run include:
+With admin inventory enabled, the registry supports one or several simultaneously prepared flavors. Each entry includes `load_balancer_id`, `octavia_flavor`, the full `amphorae` list, `primary_amphora`, and `prometheus_libvirt_domains`. For a single/standalone Amphora the convenience fields propagated to each run include:
 
 ```yaml
 amphora_id: <octavia-amphora-uuid>
@@ -645,7 +678,19 @@ prometheus_libvirt_domain_regex: instance-00123456
 
 For ACTIVE_STANDBY, use the full `amphorae` list; it records both MASTER and BACKUP rather than assuming one VM.
 
-Each run preserves the same data in its collected `target.yml`, generated manifest, and `summary.json`. In addition, the persistent-LB setup directory preserves:
+For a tenant-only run with no `admin_cloud`, this enrichment is skipped rather than treated as an error. Campaign state records:
+
+```yaml
+amphora_inventory_status: skipped
+amphora_inventory_message: openstack.admin_cloud is not configured; operator Amphora/Nova inventory skipped
+amphora_count: 0
+amphorae: []
+prometheus_libvirt_domains: []
+```
+
+If an admin profile is configured but operator inventory cannot be collected, benchmark-driven capture records `amphora_inventory_status: error` and continues. This means a normal project user can run the same performance scenarios without operator visibility.
+
+Each run preserves the same available data in its collected `target.yml`, generated manifest, and `summary.json`. In addition, the persistent-LB setup directory preserves:
 
 ```text
 results/<campaign-id>-<flavor>-campaign-lb/campaign-state.yml
@@ -665,4 +710,3 @@ jq '{
 ```
 
 Then use `amphora_instance_name` as the Prometheus `domain` label and set Grafana/Prometheus to the saved absolute UTC load window (optionally padded by about five minutes on each side).
-

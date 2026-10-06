@@ -7,7 +7,12 @@ from typing import Any
 
 
 def decode_cloud(value: Any) -> str | dict[str, Any]:
-    """Accept a named cloud, an inline cloud dict, or a JSON-encoded form of either."""
+    """Accept a named clouds.yaml profile or an inline/JSON cloud mapping.
+
+    Benchmark configuration should normally pass a named clouds.yaml profile.
+    Inline mappings remain supported for helper-script compatibility, but are not
+    documented as the preferred benchmark configuration.
+    """
     if isinstance(value, dict):
         return copy.deepcopy(value)
     if not isinstance(value, str) or not value.strip():
@@ -47,8 +52,8 @@ def connect(value: Any, region: str | None = None):
     cloud = decode_cloud(value)
     kwargs = connection_kwargs(cloud, region)
     if isinstance(cloud, dict):
-        # Connection() with explicit kwargs does not fall back to clouds.yaml or
-        # ambient OS_* variables. That keeps tenant/admin inline identities isolated.
+        # Explicit Connection() avoids falling back to ambient clouds.yaml/OS_* when
+        # a helper is intentionally passed a complete inline identity.
         return connection.Connection(**kwargs)
     return openstack.connect(**kwargs)
 

@@ -165,7 +165,7 @@ Optional listener/pool TLS versions and ciphers can be configured under `tls:`. 
 - Python 3.10+
 - `ssh-keygen`
 - `openssl`
-- A tenant OpenStack `clouds.yaml` profile with Nova, Neutron, Octavia, and (for TLS termination/re-encryption) Barbican/key-manager permissions, plus a separate admin/operator profile for Octavia Amphora inventory and backing Nova/Neutron metadata
+- A tenant/project OpenStack `clouds.yaml` profile with Nova, Neutron, Octavia, and (for TLS termination/re-encryption) Barbican/key-manager permissions; an operator/admin profile is optional
 - A routable external network for the Locust master floating IP and SNAT
 - An Ubuntu-like image with cloud-init and Python; Ubuntu 24.04 is the recommended baseline
 - Enough quotas for 1 master + configured workers + configured backends, ports, security groups, floating IPs, load balancers, temporary Barbican secrets, and (for dedicated generator modes) an additional network/subnet/router
@@ -174,24 +174,42 @@ Optional listener/pool TLS versions and ciphers can be configured under `tls:`. 
 
 ## OpenStack authentication
 
-Prefer `~/.config/openstack/clouds.yaml` and reference only profile names in `config/local.yml`. Keep the benchmark tenant and operator credentials separate:
+Keep credentials in `~/.config/openstack/clouds.yaml`; `config/local.yml` should contain only named cloud profiles. The tenant/project profile is required. An operator/admin profile is optional and is used only for Amphora/Nova inventory enrichment and operator-only failure diagnostics.
+
+For example, the local `clouds.yaml` may contain profiles named:
+
+```yaml
+clouds:
+  rxt-dfw:
+    # tenant/project authentication lives here
+  rst-dfw-admin:
+    # operator authentication lives here
+```
+
+Then the benchmark configuration only references those names:
 
 ```yaml
 openstack:
-  cloud: sjc3
-  admin_cloud: sjc3-admin
-  region_name: SJC3
+  cloud: rxt-dfw
+  admin_cloud: rst-dfw-admin
+  region_name: null
 ```
 
-`openstack.cloud` is used for normal provisioning and benchmark operations. `openstack.admin_cloud` is used only by Amphora inventory/failure diagnostics to call the admin-only Octavia Amphora API and inspect the backing Nova/Neutron resources. The admin profile should have the operator permissions required for those reads; do not grant those permissions to the benchmark tenant profile. Credentials themselves remain in `clouds.yaml`, not this repository.
+For a tenant-only/non-admin benchmark, omit `admin_cloud` or set it to `null`:
 
-For SJC3, start with your existing working tenant and admin cloud profiles rather than embedding credentials here. Endpoint and credential details therefore remain outside the Git repository.
+```yaml
+openstack:
+  cloud: rxt-dfw
+  admin_cloud: null
+```
+
+The benchmark itself does not require operator credentials. Without `admin_cloud`, load generation, Octavia provisioning, result collection, and comparisons still run normally; only Amphora/Nova/libvirt inventory enrichment is skipped. Do not put usernames, passwords, application credentials, or tokens in this repository.
 
 ## Quick start
 
 ```bash
 cp config/example.yml config/local.yml
-# edit cloud/admin_cloud, environment label, image, external network, operator_cidr, and Octavia flavor names
+# edit tenant cloud, optional admin cloud, image, external network, operator_cidr, and Octavia flavor names
 make bootstrap
 make validate CONFIG=config/local.yml
 make provision CONFIG=config/local.yml
@@ -306,7 +324,7 @@ The comparison fingerprint intentionally excludes the Octavia flavor under test 
 
 ## Benchmark methodology
 
-The default concurrency staircase is 250, 500, 1k, 2k, 4k, then 8k concurrent Locust users. Each Octavia flavor/scenario combination runs three times by default, with run order randomized to reduce time/order bias. Static responses stay hot in the nginx page cache. Locust uses `FastHttpUser` and no artificial think-time, making this a saturation-oriented benchmark rather than an end-user behavior simulation.
+The reference characterization staircase is 250, 500, 1k, 2k, and 4k concurrent Locust users with per-level durations of 30, 30, 45, 45, and 60 seconds respectively (210 seconds of steady load per run). Spawn rates are 500, 1000, 2000, 2000, and 4000 users/s. Each Octavia flavor/scenario combination runs three times by default, with run order randomized to reduce time/order bias. This staircase is the reporting baseline for the standard keepalive/churn characterization scenarios; adaptive max-RPS and connection-capacity scenarios use their own purpose-built profiles. Static responses stay hot in the nginx page cache. Locust uses `FastHttpUser` and no artificial think-time, making this a saturation-oriented benchmark rather than an end-user behavior simulation.
 
 For comparative work:
 
@@ -411,15 +429,17 @@ The canonical baseline runbook runs one Octavia flavor at a time. Use `FLAVOR=<n
 
 Each suite gets a `suite_id` shared by its direct controls and Octavia runs. Direct controls carry `baseline_for_flavor` for provenance while remaining `target_kind=direct`. Persistent LB creation resolves the requested Octavia flavor to a UUID and verifies the created LB's `flavor_id` before benchmark traffic begins. Combined campaign reports keep legacy unscoped direct controls separate rather than assigning them to a flavor implicitly.
 
-### Amphora / Nova identity state
+### Optional Amphora / Nova identity state
 
-Persistent-LB campaigns now capture the Amphora-to-Nova mapping immediately after the LB becomes ACTIVE. While a campaign is running, inspect `state/current_campaign_lbs.yml`; it contains one entry per active flavor and is safe for multi-flavor `benchmark.py --reuse-load-balancer` runs. Each flavor also keeps its normal `state/campaign_lb-<flavor>-<campaign-id>.yml` state file, enriched with the same identity data.
-
-This capture uses `openstack.admin_cloud`, not the tenant `openstack.cloud`, because Octavia's Amphora inventory endpoint is admin-only and the backing Nova/Neutron metadata requires operator visibility.
+When `openstack.admin_cloud` is configured, persistent-LB campaigns capture the Amphora-to-Nova mapping immediately after the LB becomes ACTIVE. While a campaign is running, inspect `state/current_campaign_lbs.yml`; it contains one entry per active flavor and is safe for multi-flavor `benchmark.py --reuse-load-balancer` runs. Each flavor also keeps its normal `state/campaign_lb-<flavor>-<campaign-id>.yml` state file, enriched with the same identity data.
 
 For every Amphora the state records the Octavia Amphora ID/role/status, Nova `compute_id`, libvirt `instance_name`, compute host, hypervisor hostname, availability zone, management/VRRP addresses, image ID, and compute flavor ID. A `primary_amphora` convenience object selects `STANDALONE`, then `MASTER`, then the first Amphora. `prometheus_libvirt_domains` and `prometheus_libvirt_domain_regex` are included for historical libvirt queries.
 
-Every scenario's `state/current_target.yml` inherits this identity, and normal collection therefore preserves it in the result `target.yml`, `manifest.json`/`manifest.yml`, `RUN_MANIFEST.md`, and `summary.json`. The campaign-LB artifact directory also retains `campaign-state.yml`, so the Nova/libvirt identity is still available after final LB cleanup deletes the Amphora.
+If `admin_cloud` is omitted, the benchmark does **not** fail. Campaign state is still written with the LB/VIP/flavor information and records `amphora_inventory_status: skipped`; the admin-only Amphora/Nova/libvirt fields remain empty. This is the supported path for non-admin users benchmarking within their own project.
+
+If an admin profile is configured but inventory collection fails, benchmark-driven capture is best-effort: the campaign records `amphora_inventory_status: error` and continues. The standalone `amphora_inventory.py capture` command remains strict unless `--optional` is supplied.
+
+Every scenario's `state/current_target.yml` inherits whatever identity data is available, and normal collection preserves it in the result `target.yml`, `manifest.json`/`manifest.yml`, `RUN_MANIFEST.md`, and `summary.json`. The campaign-LB artifact directory also retains `campaign-state.yml`, so operator identity remains available after final LB cleanup when it was captured.
 
 Useful examples:
 
@@ -432,4 +452,3 @@ yq '.load_balancers[] | {flavor: .octavia_flavor, lb: .load_balancer_id, amphora
 jq '{flavor: .octavia_flavor, compute_id: .amphora_compute_id, domain: .amphora_instance_name, host: .amphora_compute_host}' \
   results/<run>/summary.json
 ```
-

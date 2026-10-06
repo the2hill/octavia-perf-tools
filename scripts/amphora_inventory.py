@@ -39,19 +39,18 @@ def attr(obj: Any, name: str, default: Any = None) -> Any:
     return default if value is None else value
 
 
-def connect_from_config(config_path: pathlib.Path):
+def admin_connection_from_config(config_path: pathlib.Path):
     cfg = load_yaml(config_path)
     cloud_cfg = cfg.get("openstack") or {}
     admin_cloud = cloud_cfg.get("admin_cloud")
     if not admin_cloud:
-        raise SystemExit(
-            "openstack.admin_cloud is required for Amphora/Nova inventory capture"
-        )
-    region = cloud_cfg.get("region_name")
+        return None
+
+    region = str(cloud_cfg.get("region_name") or "") or None
     try:
-        return openstack_connect(admin_cloud, str(region) if region else None)
+        return openstack_connect(admin_cloud, region)
     except (RuntimeError, ValueError) as exc:
-        raise SystemExit(str(exc)) from exc
+        raise RuntimeError(str(exc)) from exc
 
 
 def nova_details(conn: Any, compute_id: str) -> dict[str, Any]:
@@ -134,7 +133,9 @@ def update_registry(registry_path: pathlib.Path, state: dict[str, Any]) -> None:
     ]
     load_balancers.append(state)
     registry["load_balancers"] = load_balancers
-    registry["updated_at_utc"] = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+    registry["updated_at_utc"] = (
+        dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+    )
     write_yaml(registry_path, registry)
 
 
@@ -151,8 +152,47 @@ def remove_registry_entry(registry_path: pathlib.Path, campaign_id: str, flavor:
         )
     ]
     registry["load_balancers"] = remaining
-    registry["updated_at_utc"] = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+    registry["updated_at_utc"] = (
+        dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+    )
     write_yaml(registry_path, registry)
+
+
+def persist_state(
+    args: argparse.Namespace,
+    state_path: pathlib.Path,
+    state: dict[str, Any],
+) -> None:
+    write_yaml(state_path, state)
+    if args.registry_file:
+        update_registry(pathlib.Path(args.registry_file), state)
+    if args.archive_file:
+        write_yaml(pathlib.Path(args.archive_file), state)
+
+
+def mark_unavailable(
+    args: argparse.Namespace,
+    state_path: pathlib.Path,
+    state: dict[str, Any],
+    *,
+    status: str,
+    message: str,
+) -> None:
+    state.update(
+        {
+            "state_schema_version": 3,
+            "amphora_inventory_status": status,
+            "amphora_inventory_message": message,
+            "amphora_inventory_captured_at_utc": None,
+            "amphora_count": 0,
+            "amphorae": [],
+            "primary_amphora": None,
+            "prometheus_libvirt_domains": [],
+            "prometheus_libvirt_domain_regex": None,
+        }
+    )
+    persist_state(args, state_path, state)
+    print(json.dumps(state, indent=2, default=str))
 
 
 def capture(args: argparse.Namespace) -> None:
@@ -165,30 +205,80 @@ def capture(args: argparse.Namespace) -> None:
     if not lb_id:
         raise SystemExit("load_balancer_id is missing from campaign state")
 
-    conn = connect_from_config(pathlib.Path(args.config))
+    try:
+        conn = admin_connection_from_config(pathlib.Path(args.config))
+    except Exception as exc:
+        if not args.optional:
+            raise SystemExit(str(exc)) from exc
+        message = f"admin inventory connection failed: {type(exc).__name__}: {exc}"
+        print(f"WARNING: {message}")
+        mark_unavailable(
+            args,
+            state_path,
+            state,
+            status="error",
+            message=message,
+        )
+        return
+
+    if conn is None:
+        message = "openstack.admin_cloud is not configured; operator Amphora/Nova inventory skipped"
+        if not args.optional:
+            raise SystemExit(
+                "openstack.admin_cloud is required for Amphora/Nova inventory capture"
+            )
+        print(f"INFO: {message}")
+        mark_unavailable(
+            args,
+            state_path,
+            state,
+            status="skipped",
+            message=message,
+        )
+        return
+
     records: list[dict[str, Any]] = []
     last_error: Exception | None = None
     for attempt in range(1, args.retries + 1):
         try:
             amphorae = list(conn.load_balancer.amphorae(loadbalancer_id=lb_id))
             records = [amphora_record(conn, amphora) for amphora in amphorae]
-            if records and all(item.get("compute_id") and item.get("instance_name") for item in records):
+            if records and all(
+                item.get("compute_id") and item.get("instance_name")
+                for item in records
+            ):
                 break
-        except Exception as exc:  # capture is retried because Nova/Octavia data can lag LB ACTIVE briefly
+        except Exception as exc:  # Nova/Octavia admin data can lag LB ACTIVE briefly.
             last_error = exc
             records = []
         if attempt < args.retries:
             time.sleep(args.delay_seconds)
 
     provider = str(state.get("provider") or "")
+    error_message: str | None = None
     if provider.lower() == "amphora" and not records:
         detail = f": {last_error}" if last_error else ""
-        raise SystemExit(f"no Amphora inventory found for load balancer {lb_id}{detail}")
-    if provider.lower() == "amphora" and any(not item.get("instance_name") for item in records):
-        raise SystemExit(
+        error_message = f"no Amphora inventory found for load balancer {lb_id}{detail}"
+    elif provider.lower() == "amphora" and any(
+        not item.get("instance_name") for item in records
+    ):
+        error_message = (
             f"Amphora inventory for load balancer {lb_id} is missing Nova instance_name; "
-            "the benchmark account may not have access to extended server attributes"
+            "the admin cloud may not have access to extended server attributes"
         )
+
+    if error_message:
+        if not args.optional:
+            raise SystemExit(error_message)
+        print(f"WARNING: {error_message}")
+        mark_unavailable(
+            args,
+            state_path,
+            state,
+            status="error",
+            message=error_message,
+        )
+        return
 
     primary_record = choose_primary(records)
     primary = dict(primary_record) if primary_record else None
@@ -196,7 +286,9 @@ def capture(args: argparse.Namespace) -> None:
     captured = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
     state.update(
         {
-            "state_schema_version": 2,
+            "state_schema_version": 3,
+            "amphora_inventory_status": "captured",
+            "amphora_inventory_message": None,
             "amphora_inventory_captured_at_utc": captured,
             "amphora_count": len(records),
             "amphorae": records,
@@ -206,12 +298,7 @@ def capture(args: argparse.Namespace) -> None:
         }
     )
 
-    write_yaml(state_path, state)
-    if args.registry_file:
-        update_registry(pathlib.Path(args.registry_file), state)
-    if args.archive_file:
-        write_yaml(pathlib.Path(args.archive_file), state)
-
+    persist_state(args, state_path, state)
     print(json.dumps(state, indent=2, default=str))
 
 
@@ -225,7 +312,9 @@ def remove(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Capture durable Octavia Amphora/Nova identity for benchmark runs")
+    parser = argparse.ArgumentParser(
+        description="Capture optional Octavia Amphora/Nova identity for benchmark runs"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     capture_parser = sub.add_parser("capture")
@@ -236,6 +325,14 @@ def main() -> None:
     capture_parser.add_argument("--archive-file")
     capture_parser.add_argument("--retries", type=int, default=12)
     capture_parser.add_argument("--delay-seconds", type=float, default=5.0)
+    capture_parser.add_argument(
+        "--optional",
+        action="store_true",
+        help=(
+            "do not fail the benchmark when admin_cloud is absent or operator inventory "
+            "cannot be collected; record skipped/error status in campaign state instead"
+        ),
+    )
     capture_parser.set_defaults(func=capture)
 
     remove_parser = sub.add_parser("remove")
@@ -250,4 +347,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

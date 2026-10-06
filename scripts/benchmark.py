@@ -12,6 +12,7 @@ from typing import Any
 
 import yaml
 
+from openstack_auth import connect as openstack_connect
 from topology import direct_backend_reachable, resolved_generator_network_mode
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -433,24 +434,14 @@ def resolve_octavia_flavor(config: pathlib.Path, flavor: str) -> dict[str, Any] 
     if flavor == "default":
         return None
 
-    try:
-        import openstack
-    except ImportError as exc:
-        raise RuntimeError(
-            "openstacksdk is required to resolve the Octavia flavor; run make bootstrap"
-        ) from exc
-
     cfg = yaml.safe_load(config.read_text()) or {}
     cloud_cfg = cfg.get("openstack") or {}
     cloud = cloud_cfg.get("cloud")
     if not cloud:
         raise RuntimeError("openstack.cloud is required to resolve the Octavia flavor")
 
-    connect_args: dict[str, Any] = {"cloud": cloud}
     region = cloud_cfg.get("region_name")
-    if region:
-        connect_args["region_name"] = region
-    conn = openstack.connect(**connect_args)
+    conn = openstack_connect(cloud, str(region) if region else None)
     obj = conn.load_balancer.find_flavor(flavor, ignore_missing=True)
     if obj is None:
         raise RuntimeError(f"Octavia flavor {flavor!r} was not found")
@@ -578,6 +569,7 @@ def prepare_campaign_lb(
                 str(ROOT / "state" / "current_campaign_lbs.yml"),
                 "--archive-file",
                 str(result_dir / "campaign-state.yml"),
+                "--optional",
             )
             state = yaml.safe_load(state_path.read_text()) or {}
             actual_flavor_id = str(state.get("flavor_id") or "")
@@ -592,6 +584,11 @@ def prepare_campaign_lb(
             print(f"  name:   {state.get('load_balancer_name', lb_name)}", flush=True)
             print(f"  id:     {state.get('load_balancer_id', '<unknown>')}", flush=True)
             print(f"  VIP:    {state.get('vip_address', '<unknown>')}", flush=True)
+            inventory_status = str(state.get("amphora_inventory_status") or "unknown")
+            inventory_message = state.get("amphora_inventory_message")
+            print(f"  Operator inventory: {inventory_status}", flush=True)
+            if inventory_message:
+                print(f"    {inventory_message}", flush=True)
             for amphora in state.get("amphorae") or []:
                 print(
                     "  Amphora: "

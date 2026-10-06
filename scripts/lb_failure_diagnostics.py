@@ -38,8 +38,6 @@ def record_error(data: dict[str, Any], key: str, exc: Exception) -> None:
 
 def status_tree(conn: Any, lb_id: str) -> Any:
     # openstacksdk does not expose this Octavia endpoint as a first-class helper.
-    # The proxy session is a keystoneauth Adapter, so a service-relative path is
-    # preferred and keeps catalog/interface/region selection intact.
     response = conn.load_balancer._session.get(  # noqa: SLF001 - intentional SDK adapter use
         f"/lbaas/loadbalancers/{lb_id}/status"
     )
@@ -49,7 +47,7 @@ def status_tree(conn: Any, lb_id: str) -> Any:
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Capture best-effort Octavia/Nova/Neutron state after a failed LB build"
+        description="Capture best-effort Octavia state and optional operator diagnostics after a failed LB build"
     )
     ap.add_argument("--config", required=True)
     ap.add_argument("--load-balancer", required=True)
@@ -68,27 +66,31 @@ def main() -> None:
     region = str(cloud_cfg.get("region_name") or "") or None
     if not cloud:
         raise SystemExit("openstack.cloud is required in the benchmark config")
-    if not admin_cloud:
-        raise SystemExit(
-            "openstack.admin_cloud is required for Amphora/Nova diagnostics"
-        )
 
     out: dict[str, Any] = {
         "captured_at_utc": dt.datetime.now(dt.timezone.utc)
         .replace(microsecond=0)
         .isoformat(),
         "cloud": cloud_label(cloud, "inline-tenant"),
-        "admin_cloud": cloud_label(admin_cloud, "inline-admin"),
+        "admin_cloud": cloud_label(admin_cloud, "inline-admin") if admin_cloud else None,
         "region": region,
         "requested_load_balancer": args.load_balancer,
+        "operator_diagnostics": {
+            "status": "pending" if admin_cloud else "skipped",
+            "reason": None if admin_cloud else "openstack.admin_cloud is not configured",
+        },
         "errors": {},
     }
 
-    conn = connect(cloud, region)
-    admin_conn = connect(admin_cloud, region)
+    try:
+        tenant_conn = connect(cloud, region)
+    except (RuntimeError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
 
     try:
-        lb = conn.load_balancer.find_load_balancer(args.load_balancer, ignore_missing=True)
+        lb = tenant_conn.load_balancer.find_load_balancer(
+            args.load_balancer, ignore_missing=True
+        )
     except Exception as exc:
         record_error(out, "find_load_balancer", exc)
         lb = None
@@ -98,88 +100,107 @@ def main() -> None:
     else:
         out["load_balancer_found"] = True
         try:
-            lb = conn.load_balancer.get_load_balancer(lb.id)
+            lb = tenant_conn.load_balancer.get_load_balancer(lb.id)
         except Exception as exc:
             record_error(out, "get_load_balancer", exc)
         out["load_balancer"] = as_dict(lb)
 
         try:
-            out["status_tree"] = status_tree(conn, lb.id)
+            out["status_tree"] = status_tree(tenant_conn, lb.id)
         except Exception as exc:
             record_error(out, "status_tree", exc)
 
         try:
-            listeners = list(conn.load_balancer.listeners(load_balancer_id=lb.id))
+            listeners = list(
+                tenant_conn.load_balancer.listeners(load_balancer_id=lb.id)
+            )
             out["listeners"] = [as_dict(x) for x in listeners]
         except Exception as exc:
             record_error(out, "listeners", exc)
 
         try:
-            pools = list(conn.load_balancer.pools(load_balancer_id=lb.id))
+            pools = list(tenant_conn.load_balancer.pools(load_balancer_id=lb.id))
             out["pools"] = [as_dict(x) for x in pools]
         except Exception as exc:
             record_error(out, "pools", exc)
 
-        amphorae: list[Any] = []
-        try:
-            amphorae = list(admin_conn.load_balancer.amphorae(loadbalancer_id=lb.id))
-            out["amphorae"] = [as_dict(x) for x in amphorae]
-        except Exception as exc:
-            record_error(out, "amphorae", exc)
-
-        nova: list[dict[str, Any]] = []
-        neutron_port_ids: set[str] = set()
-        vip_port_id = getattr(lb, "vip_port_id", None)
-        if vip_port_id:
-            neutron_port_ids.add(str(vip_port_id))
-
-        for amphora in amphorae:
-            for attr in ("vrrp_port_id", "ha_port_id"):
-                value = getattr(amphora, attr, None)
-                if value:
-                    neutron_port_ids.add(str(value))
-
-            compute_id = getattr(amphora, "compute_id", None)
-            if not compute_id:
-                continue
-            item: dict[str, Any] = {
-                "amphora_id": getattr(amphora, "id", None),
-                "compute_id": compute_id,
-            }
+        if admin_cloud:
             try:
-                server = admin_conn.compute.get_server(compute_id)
-                item["server"] = as_dict(server)
-                try:
-                    console = admin_conn.compute.get_server_console_output(server, length=120)
-                    item["console_tail"] = as_dict(console)
-                except Exception as exc:
-                    item["console_error"] = {
-                        "type": type(exc).__name__,
-                        "message": str(exc),
-                    }
+                admin_conn = connect(admin_cloud, region)
+                out["operator_diagnostics"] = {"status": "enabled", "reason": None}
             except Exception as exc:
-                item["server_error"] = {
-                    "type": type(exc).__name__,
-                    "message": str(exc),
+                admin_conn = None
+                out["operator_diagnostics"] = {
+                    "status": "error",
+                    "reason": f"{type(exc).__name__}: {exc}",
                 }
-            nova.append(item)
-        out["nova_amphora_servers"] = nova
+                record_error(out, "admin_connect", exc)
 
-        ports: list[dict[str, Any]] = []
-        for port_id in sorted(neutron_port_ids):
-            try:
-                ports.append(as_dict(admin_conn.network.get_port(port_id)))
-            except Exception as exc:
-                ports.append(
-                    {
-                        "id": port_id,
-                        "error": {
+            if admin_conn is not None:
+                amphorae: list[Any] = []
+                try:
+                    amphorae = list(
+                        admin_conn.load_balancer.amphorae(loadbalancer_id=lb.id)
+                    )
+                    out["amphorae"] = [as_dict(x) for x in amphorae]
+                except Exception as exc:
+                    record_error(out, "amphorae", exc)
+
+                nova: list[dict[str, Any]] = []
+                neutron_port_ids: set[str] = set()
+                vip_port_id = getattr(lb, "vip_port_id", None)
+                if vip_port_id:
+                    neutron_port_ids.add(str(vip_port_id))
+
+                for amphora in amphorae:
+                    for attr in ("vrrp_port_id", "ha_port_id"):
+                        value = getattr(amphora, attr, None)
+                        if value:
+                            neutron_port_ids.add(str(value))
+
+                    compute_id = getattr(amphora, "compute_id", None)
+                    if not compute_id:
+                        continue
+                    item: dict[str, Any] = {
+                        "amphora_id": getattr(amphora, "id", None),
+                        "compute_id": compute_id,
+                    }
+                    try:
+                        server = admin_conn.compute.get_server(compute_id)
+                        item["server"] = as_dict(server)
+                        try:
+                            console = admin_conn.compute.get_server_console_output(
+                                server, length=120
+                            )
+                            item["console_tail"] = as_dict(console)
+                        except Exception as exc:
+                            item["console_error"] = {
+                                "type": type(exc).__name__,
+                                "message": str(exc),
+                            }
+                    except Exception as exc:
+                        item["server_error"] = {
                             "type": type(exc).__name__,
                             "message": str(exc),
-                        },
-                    }
-                )
-        out["neutron_ports"] = ports
+                        }
+                    nova.append(item)
+                out["nova_amphora_servers"] = nova
+
+                ports: list[dict[str, Any]] = []
+                for port_id in sorted(neutron_port_ids):
+                    try:
+                        ports.append(as_dict(admin_conn.network.get_port(port_id)))
+                    except Exception as exc:
+                        ports.append(
+                            {
+                                "id": port_id,
+                                "error": {
+                                    "type": type(exc).__name__,
+                                    "message": str(exc),
+                                },
+                            }
+                        )
+                out["neutron_ports"] = ports
 
     output = pathlib.Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -199,15 +220,8 @@ def main() -> None:
                 f"id={amphora.get('id')} status={amphora.get('status')} "
                 f"compute_id={amphora.get('compute_id')} zone={amphora.get('cached_zone')}"
             )
-        for item in out.get("nova_amphora_servers", []):
-            server = item.get("server") or {}
-            if server:
-                print(
-                    "  Nova: "
-                    f"id={item.get('compute_id')} status={server.get('status')} "
-                    f"host={server.get('OS-EXT-SRV-ATTR:host') or server.get('compute_host')} "
-                    f"fault={server.get('fault')}"
-                )
+    if out.get("operator_diagnostics", {}).get("status") == "skipped":
+        print("  Operator diagnostics skipped: openstack.admin_cloud is not configured")
     if out.get("errors"):
         print("  Diagnostics warnings:")
         for key, value in out["errors"].items():
@@ -218,4 +232,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

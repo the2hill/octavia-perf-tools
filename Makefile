@@ -43,6 +43,12 @@ destroy:
 	$(ANSIBLE) playbooks/destroy.yml -e @$(CONFIG)
 
 clean:
-	rm -rf state/* results/*
-	touch state/.gitkeep results/.gitkeep
+	rm -rf results/*
+	touch results/.gitkeep
+
+clean-state:
+	rm -rf state/*
+	touch state/.gitkeep
+
+clean-all: destroy clean clean-state
 

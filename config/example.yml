@@ -10,11 +10,16 @@ metadata:
   notes: null
 
 openstack:
-  # Name of a cloud in ~/.config/openstack/clouds.yaml (preferred) or OS_CLOUD.
-  cloud: sjc3
-  region_name: SJC3
+  # Names of profiles under `clouds:` in ~/.config/openstack/clouds.yaml.
+  # The tenant/user cloud is the only required authentication setting here.
+  cloud: rxt-dfw
+  # Optional operator profile used only for Amphora/Nova inventory enrichment and
+  # operator-only failure diagnostics. Omit it or set it to null for tenant-only runs.
+  admin_cloud: null
+  # Optional region override. Leave null to use the region selected by clouds.yaml.
+  region_name: null
   # Free-form label recorded in every run manifest; it is documentation only.
-  environment_label: api.sjc3.rackspacecloud.com
+  environment_label: null
   validate_certs: true
 
 network:
@@ -124,10 +129,9 @@ benchmark:
   traffic_path: tenant_vip
 
 locust:
-  # Reference regression staircase: 210 seconds of steady load per run.
-  # duration_seconds is time spent at that level, not cumulative.
-  # The older 465-second/8000-user staircase is intentionally shortened because
-  # the useful keepalive throughput plateau is reached well below 8000 users.
+  # Reference characterization staircase used for reported baseline results.
+  # 210 seconds of steady load per run; duration_seconds is per level, not cumulative.
+  # Keep this profile unchanged when comparing Octavia flavors.
   stages:
     - { users: 250,  duration_seconds: 30, spawn_rate: 500 }
     - { users: 500,  duration_seconds: 30, spawn_rate: 1000 }
