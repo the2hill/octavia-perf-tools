@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import math
 import re
@@ -11,6 +12,7 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import yaml
 
 
 def slug(value: str) -> str:
@@ -542,6 +544,86 @@ def scenario_winners(summary: pd.DataFrame) -> pd.DataFrame:
         })
     return pd.DataFrame(rows)
 
+
+def load_json_artifact(path: Path) -> Any:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"status": "unreadable", "error": f"{type(exc).__name__}: {exc}"}
+
+
+def load_yaml_artifact(path: Path) -> Any:
+    if not path.exists():
+        return None
+    try:
+        return yaml.safe_load(path.read_text())
+    except (OSError, yaml.YAMLError) as exc:
+        return {"status": "unreadable", "error": f"{type(exc).__name__}: {exc}"}
+
+
+def dataframe_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
+    if frame.empty:
+        return []
+    # pandas' JSON encoder converts NaN/NaT to JSON null, unlike a direct
+    # to_dict() followed by json.dumps(), which can emit non-standard NaN.
+    return json.loads(frame.to_json(orient="records", date_format="iso"))
+
+
+def build_campaign_diagnostics(
+    selected: pd.DataFrame,
+    summary: pd.DataFrame,
+    direct_summary: pd.DataFrame,
+    scorecard: pd.DataFrame,
+    winners: pd.DataFrame,
+    reference_flavor: str | None,
+    latest_per_group: int,
+) -> dict[str, Any]:
+    runs: list[dict[str, Any]] = []
+    status_counts: dict[str, int] = {}
+
+    ordered = selected.sort_values(["sort_time", "result_dir"]) if not selected.empty else selected
+    for _, row in ordered.iterrows():
+        result_dir = Path(str(row["summary_path"])).parent
+        prometheus = load_json_artifact(result_dir / "prometheus-diagnostics.json")
+        if prometheus is None:
+            prometheus = {"status": "missing"}
+        prom_status = str(prometheus.get("status") or "unknown") if isinstance(prometheus, dict) else "unknown"
+        status_counts[prom_status] = status_counts.get(prom_status, 0) + 1
+
+        runs.append(
+            {
+                "result_dir": result_dir.name,
+                "source_path": str(result_dir),
+                "summary": load_json_artifact(result_dir / "summary.json"),
+                "timing": load_yaml_artifact(result_dir / "timing.yml"),
+                "target": load_yaml_artifact(result_dir / "target.yml"),
+                # Intentionally embed the full query expressions, returned range
+                # samples/statistics, and query errors for bottleneck analysis.
+                "prometheus_diagnostics": prometheus,
+            }
+        )
+
+    return {
+        "schema_version": 1,
+        "generated_at_utc": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat(),
+        "selection": {
+            "latest_per_group": latest_per_group,
+            "reference_flavor": reference_flavor,
+            "selected_octavia_runs": len(runs),
+            "prometheus_status_counts": status_counts,
+        },
+        "campaign": {
+            "selected_runs": dataframe_records(selected),
+            "scenario_summary": dataframe_records(summary),
+            "flavor_scorecard": dataframe_records(scorecard),
+            "scenario_winners": dataframe_records(winners),
+            "direct_reference_summary": dataframe_records(direct_summary),
+        },
+        "runs": runs,
+    }
+
 def write_reports(
     out: Path,
     selected: pd.DataFrame,
@@ -559,6 +641,19 @@ def write_reports(
     winners.to_csv(out / "scenario-winners.csv", index=False)
     if not direct_summary.empty:
         direct_summary.to_csv(out / "direct-reference-summary.csv", index=False)
+
+    diagnostics = build_campaign_diagnostics(
+        selected,
+        summary,
+        direct_summary,
+        scorecard,
+        winners,
+        reference_flavor,
+        latest_per_group,
+    )
+    (out / "campaign-diagnostics.json").write_text(
+        json.dumps(diagnostics, indent=2, sort_keys=False) + "\n"
+    )
 
     flavor_names = [str(x) for x in scorecard["octavia_flavor"].tolist()] if not scorecard.empty else []
     scenario_count = summary[["scenario_name", "traffic_path", "generator_network_mode"]].drop_duplicates().shape[0]
@@ -956,6 +1051,7 @@ def main() -> None:
     print(f"Fingerprint-warning groups: {warning_groups}")
     print(f"Report: {out / 'README.md'}")
     print(f"Detailed: {out / 'DETAILED_COMPARISON.md'}")
+    print(f"Diagnostics bundle: {out / 'campaign-diagnostics.json'}")
     print(f"Dashboard: {out / 'charts' / 'composite-dashboard.png'}")
     print(f"CSV: {out / 'scenario-summary.csv'}")
     if args.strict_fingerprint and warning_groups:

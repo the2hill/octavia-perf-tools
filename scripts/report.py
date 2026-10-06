@@ -228,6 +228,7 @@ def report_locust(root: Path, charts: Path, target: dict, cfg: dict, manifest: d
         "max_rps_max_tested_users": None,
         "max_rps_limit_reached": None,
         "max_rps_generator_limited": None,
+        "max_rps_generator_cpu_hot": None,
         "max_rps_search_steps": None,
         "max_rps_best_p99_ms": None,
         "max_rps_best_failure_percent": None,
@@ -262,7 +263,19 @@ def report_locust(root: Path, charts: Path, target: dict, cfg: dict, manifest: d
         max_rps_result["max_rps_max_tested_users"] = int(search["target_users"].max())
         max_rps_result["max_rps_limit_reached"] = bool(not quality_failed.empty)
         max_rps_result["max_rps_generator_limited"] = generator_limited
+        generator_cpu_hot = any(
+            "locust" in str(item.get("node") or "").lower()
+            for item in bottlenecks
+        )
+        max_rps_result["max_rps_generator_cpu_hot"] = generator_cpu_hot
         max_rps_result["max_rps_search_steps"] = int(len(search))
+        if generator_cpu_hot:
+            max_rps_result["validity_warnings"].append(
+                "One or more Locust generator nodes crossed metrics.cpu_warn_percent. "
+                "The client fleet may be contributing to the observed max-RPS ceiling even "
+                "though it reached the requested user counts; add generator CPU/source-IP "
+                "headroom before attributing the ceiling solely to Octavia."
+            )
         if generator_limited:
             max_rps_result["validity_warnings"].append(
                 "Generator fleet could not reach at least one requested Locust user target before max_rps.user_reach_timeout_seconds; treat the reported RPS as generator-bounded until client capacity is increased."
@@ -459,6 +472,7 @@ def report_capacity(root: Path, charts: Path, target: dict, cfg: dict, manifest:
             "max_rps_max_tested_users": None,
             "max_rps_limit_reached": None,
             "max_rps_generator_limited": None,
+            "max_rps_generator_cpu_hot": None,
             "max_rps_search_steps": None,
             "max_rps_best_p99_ms": None,
             "max_rps_best_failure_percent": None,
