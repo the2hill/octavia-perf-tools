@@ -140,22 +140,6 @@ FLAVOR=my-experimental-flavor \
 
 The runbook pauses only after the persistent LB/amphora is successfully provisioned and prints that the flavor can be disabled. Disable the flavor, then press Enter; subsequent scenarios reuse the existing LB and do not create another Amphora.
 
-## Reference characterization staircase
-
-The standard reported characterization runs use this fixed Locust staircase:
-
-```yaml
-locust:
-  stages:
-    - { users: 250,  duration_seconds: 30, spawn_rate: 500 }
-    - { users: 500,  duration_seconds: 30, spawn_rate: 1000 }
-    - { users: 1000, duration_seconds: 45, spawn_rate: 2000 }
-    - { users: 2000, duration_seconds: 45, spawn_rate: 2000 }
-    - { users: 4000, duration_seconds: 60, spawn_rate: 4000 }
-```
-
-That is 210 seconds of steady load per run. The default three repetitions are the baseline used for reported HTTP/TLS characterization results. Keep this staircase unchanged when comparing flavors. Adaptive `*_max_rps` and `*_max_connections_active` scenarios use separate search/capacity profiles and should not be compared as though they used this fixed staircase.
-
 ## Find maximum sustainable RPS
 
 Plain HTTP:
@@ -221,7 +205,7 @@ The max-connection staircase is specified **per generator VM**:
 
 ```yaml
 connection_capacity:
-  max_levels_per_worker: [250, 1250, 2500, 6250, 12500, 18750, 25000, 31250, 37500, 43750, 50000, 52500, 55000]
+  max_levels_per_worker: [250, 1250, 2500, 6250, 12500, 25000, 37500, 50000, 55000]
   source_port_guard_per_worker: 55000
 ```
 
@@ -420,6 +404,10 @@ Important fields in `summary.json`:
 - `capacity_failure_threshold_percent`
 
 For a standard capacity scenario, if `capacity_limit_reached` is false, increase `connection_capacity.levels`; the test demonstrated a lower bound but did not find the ceiling. For a `*_max_connections_active` scenario, a false value at the final generated level means the **generator source-port safety ceiling** was reached. Increase `vm.locust.worker_vms` (or deliberately provide additional source IPs) rather than raising the per-worker guard blindly.
+
+The reference max-connection staircase uses nine per-worker levels. With the baseline 16 generator VMs these are global targets of **4k, 20k, 40k, 100k, 200k, 400k, 600k, 800k, and 880k**. The 60-second hold remains intentional: connection-capacity testing must prove session survival. `connect_timeout_seconds` defaults to 5 seconds so an overloaded TLS level cannot spend long periods waiting on connections that are already unusable for this baseline.
+
+A failure in `scripts/report.py` is treated as a **post-processing failure**, not a failed load test. Raw CSVs, collected metrics, the manifest, and timing data remain valid and can be reprocessed by rerunning `scripts/report.py RESULT_DIR`. The benchmark campaign continues and writes `REPORT_FAILED.yml` in that result directory.
 
 For `*_max_rps` runs, also inspect:
 

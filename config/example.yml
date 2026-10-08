@@ -184,19 +184,15 @@ connection_capacity:
     - 2500
     - 6250
     - 12500
-    - 18750
     - 25000
-    - 31250
     - 37500
-    - 43750
     - 50000
-    - 52500
     - 55000
   ramp_seconds: 30
   hold_seconds: 60
   heartbeat_seconds: 10
   inter_level_cooldown_seconds: 10
-  connect_timeout_seconds: 10
+  connect_timeout_seconds: 5
   request_timeout_seconds: 10
   # Limits concurrent connection/open and heartbeat coroutines per generator VM.
   open_concurrency_per_worker: 512
