@@ -51,7 +51,7 @@
           - "{{ root_dir }}/state/tls/frontend.p12"
           - --content-type
           - application/octet-stream
-      no_log: true
+      no_log: "{{ openstack.cloud is mapping }}"
       register: frontend_secret_cmd
       when: scenario.frontend_tls_termination | default(false) | bool
       changed_when: true
@@ -86,7 +86,7 @@
           - "{{ root_dir }}/state/tls/ca.crt"
           - --content-type
           - application/octet-stream
-      no_log: true
+      no_log: "{{ openstack.cloud is mapping }}"
       register: backend_ca_secret_cmd
       when: scenario.backend_reencrypt | default(false) | bool
       changed_when: true
@@ -108,6 +108,20 @@
             - {{ backend_ca_secret.secret_ref | to_json }}
       when: scenario.backend_reencrypt | default(false) | bool
 
+    - name: Wait for persistent load balancer to be mutable
+      ansible.builtin.command:
+        argv:
+          - "{{ root_dir }}/.venv/bin/python"
+          - "{{ root_dir }}/scripts/octavia_tls.py"
+          - wait-lb
+          - --cloud
+          - "{{ openstack.cloud | to_json }}"
+          - --region
+          - "{{ openstack.region_name | default('') }}"
+          - --load-balancer-id
+          - "{{ campaign_lb.load_balancer_id }}"
+      changed_when: false
+
     - name: Create scenario listener on persistent load balancer
       openstack.cloud.lb_listener:
         cloud: "{{ (openstack.cloud | combine({'region_name': openstack.region_name})) if (openstack.cloud is mapping and (openstack.region_name | default(''))) else openstack.cloud }}"
@@ -121,6 +135,9 @@
         timeout: 600
         state: present
       register: listener
+      retries: 5
+      delay: 3
+      until: listener is succeeded
 
     - name: Apply benchmark listener limits, timeouts, and optional TLS settings
       ansible.builtin.command:
@@ -144,13 +161,27 @@
           - "{{ octavia.listener.timeout_client_data_ms | default(300000) }}"
           - --timeout-member-data
           - "{{ octavia.listener.timeout_member_data_ms | default(300000) }}"
-      no_log: true
+      no_log: "{{ openstack.cloud is mapping }}"
       register: listener_tuning_cmd
       changed_when: true
 
     - name: Parse applied listener benchmark settings
       ansible.builtin.set_fact:
         listener_tuning: "{{ listener_tuning_cmd.stdout | from_json }}"
+
+    - name: Wait for load balancer after listener update
+      ansible.builtin.command:
+        argv:
+          - "{{ root_dir }}/.venv/bin/python"
+          - "{{ root_dir }}/scripts/octavia_tls.py"
+          - wait-lb
+          - --cloud
+          - "{{ openstack.cloud | to_json }}"
+          - --region
+          - "{{ openstack.region_name | default('') }}"
+          - --load-balancer-id
+          - "{{ campaign_lb.load_balancer_id }}"
+      changed_when: false
 
     - name: Create scenario pool
       openstack.cloud.lb_pool:
@@ -164,6 +195,9 @@
         timeout: 600
         state: present
       register: pool
+      retries: 5
+      delay: 3
+      until: pool is succeeded
 
     - name: Enable TLS re-encryption to backend members
       ansible.builtin.command:
@@ -183,10 +217,24 @@
           - "{{ tls.pool_tls_versions | default([]) | join(',') }}"
           - --tls-ciphers
           - "{{ tls.pool_tls_ciphers | default('') or '' }}"
-      no_log: true
+      no_log: "{{ openstack.cloud is mapping }}"
       register: pool_tls_update
       when: scenario.backend_reencrypt | default(false) | bool
       changed_when: true
+
+    - name: Wait for load balancer before adding members
+      ansible.builtin.command:
+        argv:
+          - "{{ root_dir }}/.venv/bin/python"
+          - "{{ root_dir }}/scripts/octavia_tls.py"
+          - wait-lb
+          - --cloud
+          - "{{ openstack.cloud | to_json }}"
+          - --region
+          - "{{ openstack.region_name | default('') }}"
+          - --load-balancer-id
+          - "{{ campaign_lb.load_balancer_id }}"
+      changed_when: false
 
     - name: Add backend members
       openstack.cloud.lb_member:
@@ -201,6 +249,24 @@
         timeout: 600
         state: present
       loop: "{{ groups['backends'] }}"
+      register: member_create
+      retries: 5
+      delay: 3
+      until: member_create is succeeded
+
+    - name: Wait for load balancer before health monitor
+      ansible.builtin.command:
+        argv:
+          - "{{ root_dir }}/.venv/bin/python"
+          - "{{ root_dir }}/scripts/octavia_tls.py"
+          - wait-lb
+          - --cloud
+          - "{{ openstack.cloud | to_json }}"
+          - --region
+          - "{{ openstack.region_name | default('') }}"
+          - --load-balancer-id
+          - "{{ campaign_lb.load_balancer_id }}"
+      changed_when: false
 
     - name: Create health monitor
       openstack.cloud.lb_health_monitor:
@@ -219,6 +285,24 @@
         wait: true
         timeout: 600
         state: present
+      register: health_monitor_create
+      retries: 5
+      delay: 3
+      until: health_monitor_create is succeeded
+
+    - name: Wait for configured scenario to settle
+      ansible.builtin.command:
+        argv:
+          - "{{ root_dir }}/.venv/bin/python"
+          - "{{ root_dir }}/scripts/octavia_tls.py"
+          - wait-lb
+          - --cloud
+          - "{{ openstack.cloud | to_json }}"
+          - --region
+          - "{{ openstack.region_name | default('') }}"
+          - --load-balancer-id
+          - "{{ campaign_lb.load_balancer_id }}"
+      changed_when: false
 
     - name: Persist current scenario target
       ansible.builtin.copy:

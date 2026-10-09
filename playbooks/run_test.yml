@@ -169,6 +169,83 @@
         - (target.benchmark_engine | default('locust')) == 'locust'
         - locust_master_run is defined
 
+- name: Preflight connection-capacity client path
+  hosts: locust_workers
+  gather_facts: false
+  vars:
+    target: "{{ hostvars['runtime_target'].target_state }}"
+  tasks:
+    - name: Verify one connection can be established and held
+      ansible.builtin.shell: |
+        set -euo pipefail
+        preflight_dir="/tmp/octavia-perf-capacity-preflight-{{ target.benchmark_id }}"
+        rm -rf "$preflight_dir"
+        mkdir -p "$preflight_dir"
+        cmd=(
+          /opt/octavia-perf/connection_capacity.py
+          --target-url {{ target.target_url | quote }}
+          --path {{ target.benchmark_path | quote }}
+          --capacity-mode {{ target.capacity_mode | quote }}
+          --levels 1
+          --worker-index 0
+          --worker-count 1
+          --ramp-seconds 1
+          --hold-seconds 2
+          --heartbeat-seconds 1
+          --inter-level-cooldown-seconds 0
+          --connect-timeout {{ connection_capacity.connect_timeout_seconds | quote }}
+          --request-timeout {{ connection_capacity.request_timeout_seconds | quote }}
+          --open-concurrency 1
+          --io-concurrency 1
+          --start-epoch 0
+          --output-dir "$preflight_dir"
+          --output-prefix preflight
+        )
+        {% if tls.client_insecure | default(true) | bool %}cmd+=(--insecure){% endif %}
+        {% if connection_capacity.abortive_close | default(true) | bool %}cmd+=(--abortive-close){% endif %}
+        {% if connection_capacity.verify_idle_at_end | default(true) | bool %}cmd+=(--verify-idle-at-end){% endif %}
+        {% if connection_capacity.tcp_nodelay | default(true) | bool %}cmd+=(--tcp-nodelay){% endif %}
+
+        printf 'capacity preflight command:'
+        printf ' %q' "${cmd[@]}"
+        printf '\n'
+        "${cmd[@]}"
+
+        /usr/bin/python3 - \
+          "$preflight_dir/connection-capacity-preflight.csv" \
+          "$preflight_dir/connection-errors-preflight.csv" <<'PY'
+        import csv
+        import sys
+
+        summary_path, errors_path = sys.argv[1:3]
+        with open(summary_path, newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        errors = []
+        try:
+            with open(errors_path, newline="") as stream:
+                errors = list(csv.DictReader(stream))
+        except FileNotFoundError:
+            pass
+
+        if len(rows) != 1:
+            raise SystemExit(f"capacity preflight expected one summary row, found {len(rows)}")
+        row = rows[0]
+        established = int(row.get("established") or 0)
+        surviving = int(row.get("surviving") or 0)
+        if established != 1 or surviving != 1:
+            raise SystemExit(
+                "capacity preflight failed: "
+                f"established={established}/1 surviving={surviving}/1 errors={errors}"
+            )
+        print("capacity preflight passed: established=1/1 surviving=1/1")
+        PY
+      args:
+        executable: /bin/bash
+      become: true
+      run_once: true
+      changed_when: true
+      when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
+
 - name: Prepare synchronized connection-capacity start
   hosts: localhost
   gather_facts: false
@@ -244,6 +321,9 @@
           {% if connection_capacity.abortive_close | default(true) | bool %}cmd+=(--abortive-close){% endif %}
           {% if connection_capacity.verify_idle_at_end | default(true) | bool %}cmd+=(--verify-idle-at-end){% endif %}
           {% if connection_capacity.tcp_nodelay | default(true) | bool %}cmd+=(--tcp-nodelay){% endif %}
+          printf 'capacity worker command:'
+          printf ' %q' "${cmd[@]}"
+          printf '\n'
           "${cmd[@]}" >{{ remote_result_dir }}/connection-capacity-${prefix}.log 2>&1 &
           pids+=("$!")
         done

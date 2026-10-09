@@ -53,10 +53,12 @@ The example configuration also ships disabled-but-ready profiles for:
 - `tls_termination_reencrypt_connection_capacity_active` — simultaneous active frontend TLS sessions with backend TLS re-encryption.
 - `http_1k_max_rps`, `tls_passthrough_1k_max_rps`, `tls_termination_1k_max_rps`, and `tls_termination_reencrypt_1k_max_rps` — adaptive searches for the highest sustainable request rate while enforcing failure-rate and p99 latency gates.
 - `http_max_connections_active`, `tls_passthrough_max_connections_active`, `tls_termination_max_connections_active`, and `tls_termination_reencrypt_max_connections_active` — push simultaneous active connections through a per-generator staircase ending at the configured source-port safety limit.
-- `http_64k_keepalive` and `http_1m_keepalive` — response-bandwidth profiles.
-- `tls_termination_64k_keepalive` — TLS-termination bandwidth profile.
+- `http_64k_keepalive` / `http_1m_keepalive` — plain-HTTP bandwidth profiles.
+- `tls_passthrough_64k_keepalive` / `tls_passthrough_1m_keepalive` — end-to-end TLS passthrough bandwidth profiles.
+- `tls_termination_64k_keepalive` / `tls_termination_1m_keepalive` — Octavia TLS-termination bandwidth profiles.
+- `tls_termination_reencrypt_64k_keepalive` / `tls_termination_reencrypt_1m_keepalive` — frontend termination plus backend TLS re-encryption bandwidth profiles.
 
-Connection-capacity scenarios use a distributed asyncio socket holder on the Locust worker VMs rather than Locust itself. They report establishment/survival percentages and a maximum sustainable simultaneous-connection level. The configured targets are global across all generator VMs/processes.
+Connection-capacity scenarios use a distributed asyncio socket holder on the Locust worker VMs rather than Locust itself. They report establishment/survival percentages and a maximum sustainable simultaneous-connection level. The configured targets are global across all generator VMs/processes. Before the distributed run starts, one generator performs a one-connection preflight against the real target and requires the connection to establish and survive; TLS/certificate/client-path mistakes therefore fail immediately instead of consuming an entire max-capacity staircase.
 
 The `*_max_rps` scenarios are different from the normal fixed Locust staircase. They start at `max_rps.start_users`, double concurrency until a level violates the configured request-failure or p99-latency threshold, then bisect the last passing/failing user range. Reports distinguish a bounded ceiling from a lower-bound result when `max_rps.max_users` is reached without a failure.
 
@@ -401,7 +403,7 @@ If you invoke Ansible from another working directory, either `cd` to the reposit
 
 ### Resilient baseline campaigns
 
-`scripts/run_baseline_suite.sh` creates the campaign LB once and treats failure of that initial provisioning as recoverable. By default it captures failed-LB diagnostics, cleans up the failed object, and retries creation up to three total attempts. Once the persistent LB exists, scenario failures are isolated to the listener/pool/member/health-monitor resources; cleanup removes those children while retaining the Amphora so later scenarios can continue. See `docs/USAGE.md` for the full lifecycle, artifact names, pause workflow, and retry controls.
+`scripts/run_baseline_suite.sh` creates the campaign LB once and treats failure of that initial provisioning as recoverable. By default it captures failed-LB diagnostics, cleans up the failed object, and retries creation up to three total attempts. Once the persistent LB exists, scenario setup is also retryable: every failed setup keeps its full Ansible log and scoped Octavia diagnostics, performs cleanup, verifies that the persistent LB is ACTIVE and the failed scenario children are gone, and only then retries. If cleanup verification fails or the LB enters `ERROR`, the remaining scenarios for that flavor are skipped instead of cascading failures through a poisoned Amphora. See `docs/USAGE.md` for the full lifecycle, artifact names, pause workflow, and retry controls.
 
 ## Combined comparison after separate flavor suites
 

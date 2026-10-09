@@ -13,7 +13,11 @@ bootstrap:
 	$(VENV)/bin/ansible-galaxy collection install -r collections/requirements.yml
 
 syntax:
-	$(ANSIBLE) playbooks/configure.yml --syntax-check -e @$(CONFIG)
+	@set -euo pipefail; \
+	for playbook in playbooks/*.yml; do \
+		echo "Syntax checking $$playbook"; \
+		$(ANSIBLE) "$$playbook" --syntax-check -e @$(CONFIG); \
+	done
 
 validate: syntax
 	$(PY) scripts/validate_config.py $(CONFIG)

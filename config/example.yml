@@ -321,7 +321,7 @@ scenarios:
       connection_mode: keepalive
       frontend_tls_termination: false
       backend_tls: false
-      direct_baseline: false
+      direct_baseline: true
 
     http_1m_keepalive:
       description: HTTP bandwidth/throughput profile with 1 MiB responses
@@ -335,7 +335,35 @@ scenarios:
       connection_mode: keepalive
       frontend_tls_termination: false
       backend_tls: false
-      direct_baseline: false
+      direct_baseline: true
+
+    tls_passthrough_64k_keepalive:
+      description: TLS passthrough bandwidth profile with 64 KiB responses
+      scheme: https
+      listener_protocol: HTTPS
+      listener_port: 443
+      pool_protocol: HTTPS
+      member_port: 443
+      health_monitor_type: HTTPS
+      benchmark_path: /65536.bin
+      connection_mode: keepalive
+      frontend_tls_termination: false
+      backend_tls: true
+      direct_baseline: true
+
+    tls_passthrough_1m_keepalive:
+      description: TLS passthrough bandwidth profile with 1 MiB responses
+      scheme: https
+      listener_protocol: HTTPS
+      listener_port: 443
+      pool_protocol: HTTPS
+      member_port: 443
+      health_monitor_type: HTTPS
+      benchmark_path: /1048576.bin
+      connection_mode: keepalive
+      frontend_tls_termination: false
+      backend_tls: true
+      direct_baseline: true
 
     tls_termination_64k_keepalive:
       description: TLS termination bandwidth profile with 64 KiB responses
@@ -349,6 +377,50 @@ scenarios:
       connection_mode: keepalive
       frontend_tls_termination: true
       backend_tls: false
+      direct_baseline: false
+
+    tls_termination_1m_keepalive:
+      description: TLS termination bandwidth profile with 1 MiB responses
+      scheme: https
+      listener_protocol: TERMINATED_HTTPS
+      listener_port: 443
+      pool_protocol: HTTP
+      member_port: 80
+      health_monitor_type: HTTP
+      benchmark_path: /1048576.bin
+      connection_mode: keepalive
+      frontend_tls_termination: true
+      backend_tls: false
+      direct_baseline: false
+
+    tls_termination_reencrypt_64k_keepalive:
+      description: TLS termination and backend re-encryption bandwidth profile with 64 KiB responses
+      scheme: https
+      listener_protocol: TERMINATED_HTTPS
+      listener_port: 443
+      pool_protocol: HTTP
+      member_port: 443
+      health_monitor_type: HTTPS
+      benchmark_path: /65536.bin
+      connection_mode: keepalive
+      frontend_tls_termination: true
+      backend_tls: true
+      backend_reencrypt: true
+      direct_baseline: false
+
+    tls_termination_reencrypt_1m_keepalive:
+      description: TLS termination and backend re-encryption bandwidth profile with 1 MiB responses
+      scheme: https
+      listener_protocol: TERMINATED_HTTPS
+      listener_port: 443
+      pool_protocol: HTTP
+      member_port: 443
+      health_monitor_type: HTTPS
+      benchmark_path: /1048576.bin
+      connection_mode: keepalive
+      frontend_tls_termination: true
+      backend_tls: true
+      backend_reencrypt: true
       direct_baseline: false
 
     # Adaptive max-sustainable-RPS scenarios use the same datapaths as the core
@@ -590,6 +662,9 @@ campaign:
   baseline_repetitions: 1
   randomize_run_order: true
   cooldown_seconds: 15
+  # Retry scenario child-resource setup after verified cleanup of a partial attempt.
+  scenario_setup_attempts: 2
+  scenario_setup_retry_delay_seconds: 10
 
 metrics:
   sample_interval_seconds: 1

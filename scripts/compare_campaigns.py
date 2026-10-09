@@ -28,6 +28,11 @@ def as_number(value: Any) -> float:
         return math.nan
 
 
+def finite_numeric(values: Any) -> pd.Series:
+    series = pd.to_numeric(values, errors="coerce")
+    return series.replace([np.inf, -np.inf], np.nan).dropna()
+
+
 def iso_sort_value(value: Any, fallback: str) -> str:
     text = str(value or "").strip()
     return text if text else fallback
@@ -363,18 +368,18 @@ def aggregate_octavia(selected: pd.DataFrame) -> pd.DataFrame:
         scenario, traffic_path, generator_mode, flavor = keys
         metric_names = [x for x in group["primary_metric"].dropna().unique()]
         units = [x for x in group["primary_unit"].dropna().unique()]
-        primary = pd.to_numeric(group["primary_value"], errors="coerce")
-        p99 = pd.to_numeric(group["p99_effective_ms"], errors="coerce")
-        failure = pd.to_numeric(group["failure_percent_effective"], errors="coerce")
-        requests = pd.to_numeric(group.get("requests", pd.Series(index=group.index, dtype=float)), errors="coerce")
-        failures = pd.to_numeric(group.get("failures", pd.Series(index=group.index, dtype=float)), errors="coerce")
-        amphora_peak_cpu_cores = pd.to_numeric(group.get("amphora_peak_cpu_cores", pd.Series(index=group.index, dtype=float)), errors="coerce")
-        amphora_peak_cpu_percent = pd.to_numeric(group.get("amphora_peak_cpu_percent", pd.Series(index=group.index, dtype=float)), errors="coerce")
-        amphora_hottest_vcpu_percent = pd.to_numeric(group.get("amphora_hottest_vcpu_percent", pd.Series(index=group.index, dtype=float)), errors="coerce")
-        amphora_peak_tx_pps = pd.to_numeric(group.get("amphora_peak_tx_packets_per_second", pd.Series(index=group.index, dtype=float)), errors="coerce")
-        amphora_peak_rx_pps = pd.to_numeric(group.get("amphora_peak_rx_packets_per_second", pd.Series(index=group.index, dtype=float)), errors="coerce")
-        amphora_peak_vcpu_delay = pd.to_numeric(group.get("amphora_peak_vcpu_delay_seconds_per_second", pd.Series(index=group.index, dtype=float)), errors="coerce")
-        amphora_peak_vcpu_wait = pd.to_numeric(group.get("amphora_peak_vcpu_wait_seconds_per_second", pd.Series(index=group.index, dtype=float)), errors="coerce")
+        primary = finite_numeric(group["primary_value"])
+        p99 = finite_numeric(group["p99_effective_ms"])
+        failure = finite_numeric(group["failure_percent_effective"])
+        requests = finite_numeric(group.get("requests", pd.Series(index=group.index, dtype=float)))
+        failures = finite_numeric(group.get("failures", pd.Series(index=group.index, dtype=float)))
+        amphora_peak_cpu_cores = finite_numeric(group.get("amphora_peak_cpu_cores", pd.Series(index=group.index, dtype=float)))
+        amphora_peak_cpu_percent = finite_numeric(group.get("amphora_peak_cpu_percent", pd.Series(index=group.index, dtype=float)))
+        amphora_hottest_vcpu_percent = finite_numeric(group.get("amphora_hottest_vcpu_percent", pd.Series(index=group.index, dtype=float)))
+        amphora_peak_tx_pps = finite_numeric(group.get("amphora_peak_tx_packets_per_second", pd.Series(index=group.index, dtype=float)))
+        amphora_peak_rx_pps = finite_numeric(group.get("amphora_peak_rx_packets_per_second", pd.Series(index=group.index, dtype=float)))
+        amphora_peak_vcpu_delay = finite_numeric(group.get("amphora_peak_vcpu_delay_seconds_per_second", pd.Series(index=group.index, dtype=float)))
+        amphora_peak_vcpu_wait = finite_numeric(group.get("amphora_peak_vcpu_wait_seconds_per_second", pd.Series(index=group.index, dtype=float)))
         med = primary.median()
         std = primary.std(ddof=1)
         cv = (std / med * 100.0) if pd.notna(std) and pd.notna(med) and med != 0 else math.nan
@@ -466,7 +471,7 @@ def aggregate_direct(direct: pd.DataFrame, latest_direct: int) -> pd.DataFrame:
     rows = []
     for keys, group in direct.groupby(group_cols, dropna=False):
         scenario, generator, baseline_for = keys
-        primary = pd.to_numeric(group["primary_value"], errors="coerce")
+        primary = finite_numeric(group["primary_value"])
         rows.append(
             {
                 "scenario_name": scenario,
@@ -477,7 +482,7 @@ def aggregate_direct(direct: pd.DataFrame, latest_direct: int) -> pd.DataFrame:
                 "direct_metric": group["primary_metric"].dropna().iloc[0] if group["primary_metric"].notna().any() else "",
                 "direct_unit": group["primary_unit"].dropna().iloc[0] if group["primary_unit"].notna().any() else "",
                 "direct_median_primary": primary.median(),
-                "direct_median_p99_ms": pd.to_numeric(group["p99_effective_ms"], errors="coerce").median(),
+                "direct_median_p99_ms": finite_numeric(group["p99_effective_ms"]).median(),
                 "direct_suite_ids": ",".join(sorted({str(x) for x in group["suite_id"].dropna() if str(x)})),
             }
         )
@@ -489,10 +494,10 @@ def flavor_scorecard(summary: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     rows = []
     for flavor, group in summary.groupby("octavia_flavor", dropna=False):
-        perf = pd.to_numeric(group["performance_index"], errors="coerce")
-        latency = pd.to_numeric(group["latency_index"], errors="coerce")
-        cv = pd.to_numeric(group["cv_percent"], errors="coerce")
-        failure = pd.to_numeric(group["median_failure_percent"], errors="coerce")
+        perf = finite_numeric(group["performance_index"])
+        latency = finite_numeric(group["latency_index"])
+        cv = finite_numeric(group["cv_percent"])
+        failure = finite_numeric(group["median_failure_percent"])
         wins = int((perf >= 99.999).sum())
         rows.append(
             {
@@ -525,6 +530,8 @@ def scenario_winners(summary: pd.DataFrame) -> pd.DataFrame:
         if valid.empty:
             continue
         best_value = as_number(valid.iloc[0]["median_primary"])
+        if math.isnan(best_value) or best_value <= 0:
+            continue
         winners = valid[np.isclose(valid["median_primary"].astype(float), best_value, rtol=1e-12, atol=1e-12)]
         second = valid.iloc[len(winners):len(winners)+1]
         second_value = as_number(second.iloc[0]["median_primary"]) if not second.empty else math.nan

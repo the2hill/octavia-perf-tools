@@ -357,6 +357,10 @@ def main() -> None:
         die("campaign.baseline_repetitions must be >= 0")
     if float(campaign.get("cooldown_seconds", 15)) < 0:
         die("campaign.cooldown_seconds must be >= 0")
+    if int(campaign.get("scenario_setup_attempts", 2)) < 1:
+        die("campaign.scenario_setup_attempts must be >= 1")
+    if float(campaign.get("scenario_setup_retry_delay_seconds", 10)) < 0:
+        die("campaign.scenario_setup_retry_delay_seconds must be >= 0")
 
     print(
         f"configuration OK: {path}; traffic_path={traffic_path}; "

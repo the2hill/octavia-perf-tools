@@ -143,9 +143,17 @@ If a lower level fails, the normal contiguous-staircase rule still applies: the 
 
 1 MiB responses. This is intentionally bandwidth-oriented; NIC and network-path limits can become the dominant ceiling.
 
-### `tls_termination_64k_keepalive`
+### `tls_passthrough_64k_keepalive` / `tls_passthrough_1m_keepalive`
 
-64 KiB responses with Octavia TLS termination. Compare against the HTTP 64 KiB profile to quantify TLS cost at a more bandwidth-heavy operating point.
+64 KiB and 1 MiB end-to-end TLS payload profiles. nginx performs TLS, so these quantify the passthrough datapath under payload pressure. Direct HTTPS controls are available for these scenarios.
+
+### `tls_termination_64k_keepalive` / `tls_termination_1m_keepalive`
+
+64 KiB and 1 MiB responses with Octavia TLS termination. Compare against the HTTP profiles to quantify frontend TLS cost at bandwidth-heavy operating points.
+
+### `tls_termination_reencrypt_64k_keepalive` / `tls_termination_reencrypt_1m_keepalive`
+
+64 KiB and 1 MiB responses with frontend TLS termination plus Octavia-to-member TLS re-encryption. These are the most crypto-heavy bandwidth profiles and are useful for separating pure payload throughput from double-TLS processing cost.
 
 ## Idle versus active connection capacity
 

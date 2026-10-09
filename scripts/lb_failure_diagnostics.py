@@ -37,17 +37,104 @@ def record_error(data: dict[str, Any], key: str, exc: Exception) -> None:
 
 
 def status_tree(conn: Any, lb_id: str) -> Any:
-    # openstacksdk does not expose this Octavia endpoint as a first-class helper.
-    response = conn.load_balancer._session.get(  # noqa: SLF001 - intentional SDK adapter use
-        f"/lbaas/loadbalancers/{lb_id}/status"
-    )
+    """Return the Octavia status tree using a supported keystoneauth adapter.
+
+    Newer openstacksdk Proxy objects no longer expose the private ``_session``
+    attribute. CloudRegion.get_session_client() is the supported escape hatch for
+    direct service-relative requests that are not wrapped by a high-level proxy.
+    """
+    adapter = conn.config.get_session_client("load-balancer")
+    response = adapter.get(f"/lbaas/loadbalancers/{lb_id}/status")
     response.raise_for_status()
     return response.json()
 
 
+def related_load_balancer_ids(resource: Any) -> set[str]:
+    ids: set[str] = set()
+    for attr in ("loadbalancer_id", "load_balancer_id"):
+        value = getattr(resource, attr, None)
+        if value:
+            ids.add(str(value))
+
+    for attr in ("loadbalancers", "load_balancers"):
+        values = getattr(resource, attr, None) or []
+        for item in values:
+            if isinstance(item, dict):
+                value = item.get("id")
+            else:
+                value = getattr(item, "id", None)
+            if value:
+                ids.add(str(value))
+    return ids
+
+
+def belongs_to_load_balancer(resource: Any, lb_id: str) -> bool:
+    return str(lb_id) in related_load_balancer_ids(resource)
+
+
+def collect_children(conn: Any, lb_id: str, out: dict[str, Any]) -> tuple[list[Any], list[Any]]:
+    """Collect only resources that actually belong to ``lb_id``.
+
+    Some SDK/resource versions silently ignore an unknown list filter. Filtering
+    the returned resources locally avoids diagnostics accidentally including
+    pools/listeners from unrelated load balancers in the same project.
+    """
+    listeners: list[Any] = []
+    pools: list[Any] = []
+
+    try:
+        listeners = [
+            item
+            for item in conn.load_balancer.listeners()
+            if belongs_to_load_balancer(item, lb_id)
+        ]
+        out["listeners"] = [as_dict(item) for item in listeners]
+    except Exception as exc:
+        record_error(out, "listeners", exc)
+
+    try:
+        pools = [
+            item
+            for item in conn.load_balancer.pools()
+            if belongs_to_load_balancer(item, lb_id)
+        ]
+        out["pools"] = [as_dict(item) for item in pools]
+    except Exception as exc:
+        record_error(out, "pools", exc)
+
+    members: dict[str, list[Any]] = {}
+    health_monitors: dict[str, Any] = {}
+    for pool in pools:
+        pool_id = str(getattr(pool, "id", ""))
+        if not pool_id:
+            continue
+        try:
+            members[pool_id] = [
+                as_dict(item) for item in conn.load_balancer.members(pool_id)
+            ]
+        except Exception as exc:
+            record_error(out, f"members:{pool_id}", exc)
+
+        hm_id = getattr(pool, "health_monitor_id", None)
+        if hm_id:
+            try:
+                health_monitors[pool_id] = as_dict(
+                    conn.load_balancer.get_health_monitor(hm_id)
+                )
+            except Exception as exc:
+                record_error(out, f"health_monitor:{pool_id}", exc)
+
+    out["members_by_pool"] = members
+    out["health_monitors_by_pool"] = health_monitors
+    return listeners, pools
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Capture best-effort Octavia state and optional operator diagnostics after a failed LB build"
+        description=(
+            "Capture best-effort Octavia state and optional operator diagnostics "
+            "after a failed LB build or scenario mutation"
+        )
     )
     ap.add_argument("--config", required=True)
     ap.add_argument("--load-balancer", required=True)
@@ -106,23 +193,11 @@ def main() -> None:
         out["load_balancer"] = as_dict(lb)
 
         try:
-            out["status_tree"] = status_tree(tenant_conn, lb.id)
+            out["status_tree"] = status_tree(tenant_conn, str(lb.id))
         except Exception as exc:
             record_error(out, "status_tree", exc)
 
-        try:
-            listeners = list(
-                tenant_conn.load_balancer.listeners(load_balancer_id=lb.id)
-            )
-            out["listeners"] = [as_dict(x) for x in listeners]
-        except Exception as exc:
-            record_error(out, "listeners", exc)
-
-        try:
-            pools = list(tenant_conn.load_balancer.pools(load_balancer_id=lb.id))
-            out["pools"] = [as_dict(x) for x in pools]
-        except Exception as exc:
-            record_error(out, "pools", exc)
+        collect_children(tenant_conn, str(lb.id), out)
 
         if admin_cloud:
             try:
@@ -213,6 +288,11 @@ def main() -> None:
             f"id={getattr(lb, 'id', None)} "
             f"provisioning={getattr(lb, 'provisioning_status', None)} "
             f"operating={getattr(lb, 'operating_status', None)}"
+        )
+        print(
+            "  Scoped children: "
+            f"listeners={len(out.get('listeners') or [])} "
+            f"pools={len(out.get('pools') or [])}"
         )
         for amphora in out.get("amphorae", []):
             print(

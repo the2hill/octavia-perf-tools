@@ -358,7 +358,21 @@ def parse_args() -> argparse.Namespace:
 
 async def amain() -> None:
     args = parse_args()
+    print(
+        "connection-capacity startup: "
+        f"target={args.target_url} mode={args.capacity_mode} "
+        f"insecure={args.insecure} worker={args.worker_index}/{args.worker_count} "
+        f"levels={','.join(str(x) for x in args.levels)}",
+        flush=True,
+    )
     runner = CapacityRunner(args)
+    if runner.ssl_context is not None:
+        print(
+            "TLS context: "
+            f"verify_mode={runner.ssl_context.verify_mode} "
+            f"check_hostname={runner.ssl_context.check_hostname}",
+            flush=True,
+        )
     await runner.run()
 
 

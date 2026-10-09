@@ -239,6 +239,28 @@ With four generator VMs, the higher-resolution staircase runs from 1,000 up thro
   --scenario tls_termination_reencrypt_connection_capacity_active
 ```
 
+## Run the complete bandwidth matrix
+
+The catalog includes 64 KiB and 1 MiB profiles for all four datapaths. For an initial one-repetition characterization run:
+
+```bash
+.venv/bin/python scripts/benchmark.py \
+  --config config/local.yml \
+  --scenario http_64k_keepalive \
+  --scenario http_1m_keepalive \
+  --scenario tls_passthrough_64k_keepalive \
+  --scenario tls_passthrough_1m_keepalive \
+  --scenario tls_termination_64k_keepalive \
+  --scenario tls_termination_1m_keepalive \
+  --scenario tls_termination_reencrypt_64k_keepalive \
+  --scenario tls_termination_reencrypt_1m_keepalive \
+  --repetitions 1 \
+  --reuse-load-balancer \
+  --continue-on-error
+```
+
+HTTP and TLS-passthrough bandwidth scenarios are marked for direct nginx controls so the campaign can identify generator/backend ceilings. Add `--skip-baseline` only when you intentionally want to omit those controls. Payload scenarios are compared using estimated application payload Gb/s rather than request rate.
+
 ## Run idle versus active connection state
 
 ```bash
@@ -407,6 +429,8 @@ For a standard capacity scenario, if `capacity_limit_reached` is false, increase
 
 The reference max-connection staircase uses nine per-worker levels. With the baseline 16 generator VMs these are global targets of **4k, 20k, 40k, 100k, 200k, 400k, 600k, 800k, and 880k**. The 60-second hold remains intentional: connection-capacity testing must prove session survival. `connect_timeout_seconds` defaults to 5 seconds so an overloaded TLS level cannot spend long periods waiting on connections that are already unusable for this baseline.
 
+Before any distributed connection-capacity run, one real generator executes a single-connection preflight against the configured target using the same TLS verification setting and capacity mode. The benchmark proceeds only when that connection establishes and survives. This is specifically intended to catch certificate/client-path/configuration regressions before a large max-capacity run begins.
+
 A failure in `scripts/report.py` is treated as a **post-processing failure**, not a failed load test. Raw CSVs, collected metrics, the manifest, and timing data remain valid and can be reprocessed by rerunning `scripts/report.py RESULT_DIR`. The benchmark campaign continues and writes `REPORT_FAILED.yml` in that result directory.
 
 For `*_max_rps` runs, also inspect:
@@ -495,7 +519,7 @@ create_campaign_lb.yml fails
 
 A successful retry becomes the one persistent LB used for the rest of the campaign. Initial failed provisioning attempts are diagnostic artifacts, not benchmark samples.
 
-Once the persistent LB exists, a scenario failure does **not** cause the Amphora to be rebuilt. The per-run cleanup calls `destroy_campaign_lb_scenario.yml`, which removes the scenario health monitor, members, pool, listener, temporary FIP route state, and ephemeral Barbican secrets while leaving the persistent LB/amphora intact. With `--continue-on-error`, later scenarios/repetitions can continue on that same Amphora.
+Once the persistent LB exists, a scenario setup failure does **not** immediately cause the Amphora to be rebuilt. The harness saves the full setup log and scoped Octavia diagnostics, calls `destroy_campaign_lb_scenario.yml`, then verifies independently that the persistent LB returned `ACTIVE` and that the failed scenario listener/pool are absent. `campaign.scenario_setup_attempts` (default 2) controls setup attempts and `campaign.scenario_setup_retry_delay_seconds` (default 10) controls the delay between clean retries. If cleanup verification fails or the persistent LB is `ERROR`, remaining scenarios for that flavor are skipped rather than run against a poisoned LB.
 
 The persistent campaign LB itself is deleted in final cleanup after all selected Octavia runs. This also happens when a later scenario raises an exception because the campaign lifecycle uses a `finally` cleanup.
 

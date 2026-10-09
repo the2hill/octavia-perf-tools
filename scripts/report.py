@@ -302,6 +302,8 @@ def report_capacity(root: Path, charts: Path, target: dict, cfg: dict, manifest:
         raise SystemExit("connection-capacity CSV files are empty")
 
     required_columns = {
+        "worker_index",
+        "worker_count",
         "target_global",
         "target_worker",
         "attempted",
@@ -339,6 +341,8 @@ def report_capacity(root: Path, charts: Path, target: dict, cfg: dict, manifest:
             )
 
     numeric_columns = [
+        "worker_index",
+        "worker_count",
         "target_global",
         "target_worker",
         "attempted",
@@ -365,6 +369,8 @@ def report_capacity(root: Path, charts: Path, target: dict, cfg: dict, manifest:
     grouped = (
         cap.groupby("target_global", as_index=False)
         .agg(
+            worker_rows=("worker_index", "nunique"),
+            expected_worker_count=("worker_count", "max"),
             target_worker_sum=("target_worker", "sum"),
             attempted=("attempted", "sum"),
             established=("established", "sum"),
@@ -388,6 +394,19 @@ def report_capacity(root: Path, charts: Path, target: dict, cfg: dict, manifest:
     grouped["established_percent"] = grouped["established"] / target_denominator * 100.0
     grouped["survival_percent"] = grouped["surviving"] / established_denominator * 100.0
     grouped["establishment_rate_cps"] = grouped["established"] / ramp_denominator
+    grouped["complete_worker_set"] = (
+        (grouped["worker_rows"] == grouped["expected_worker_count"])
+        & (grouped["target_worker_sum"] == grouped["target_global"])
+    )
+    incomplete_targets = [
+        int(value)
+        for value in grouped.loc[~grouped["complete_worker_set"], "target_global"].tolist()
+    ]
+    if incomplete_targets:
+        validity_warnings.append(
+            "incomplete distributed capacity data at target(s): "
+            + ", ".join(f"{value:,}" for value in incomplete_targets)
+        )
 
     latency = load_many(list(root.glob("raw/*/connection-latencies-*.csv")))
     if not latency.empty and {"target_global", "latency_ms"}.issubset(latency.columns):
@@ -484,7 +503,8 @@ def report_capacity(root: Path, charts: Path, target: dict, cfg: dict, manifest:
     threshold = float(cfg.get("connection_capacity", {}).get("failure_threshold_percent", 1.0))
     ordered = grouped.sort_values("target_global").reset_index(drop=True)
     passes = (
-        (ordered["established_percent"].fillna(0) >= 100.0 - threshold)
+        ordered["complete_worker_set"].fillna(False).astype(bool)
+        & (ordered["established_percent"].fillna(0) >= 100.0 - threshold)
         & (ordered["survival_percent"].fillna(0) >= 100.0 - threshold)
     )
 
@@ -545,6 +565,7 @@ def report_capacity(root: Path, charts: Path, target: dict, cfg: dict, manifest:
             "max_tested_connections": max_tested,
             "capacity_limit_reached": bool(capacity_limit_reached),
             "capacity_levels_tested": int(len(ordered)),
+            "incomplete_connection_targets": incomplete_targets,
             "first_failing_connection_target": first_failing_target,
             "highest_level_established_percent": float(highest["established_percent"]),
             "highest_level_survival_percent": float(highest["survival_percent"]) if pd.notna(highest["survival_percent"]) else None,
