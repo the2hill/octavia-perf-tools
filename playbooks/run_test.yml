@@ -94,3 +94,303 @@
       become: true
       when: (target.benchmark_engine | default('locust')) == 'locust'
     - name: Start worker processes
+      ansible.builtin.shell: |
+        set -euo pipefail
+        export OCTAVIA_PERF_PATH={{ target.benchmark_path | quote }}
+        export OCTAVIA_PERF_TIMEOUT={{ locust.request_timeout_seconds | quote }}
+        export OCTAVIA_PERF_CONNECTION_MODE={{ target.connection_mode | quote }}
+        export OCTAVIA_PERF_LOCUST_PROFILE={{ target.locust_profile | default('staircase') | quote }}
+        export OCTAVIA_PERF_MAX_RPS={{ max_rps_json | quote }}
+        export OCTAVIA_PERF_TLS_INSECURE={{ (tls.client_insecure | default(true) | bool) | ternary('true', 'false') | quote }}
+        nohup /opt/octavia-perf/venv/bin/locust \
+          -f /opt/octavia-perf/locustfile.py \
+          --worker \
+          --master-host {{ master_ip }} \
+          --processes {{ vm.locust.processes_per_vm }} \
+          >/var/log/octavia-perf-worker.log 2>&1 &
+      args:
+        executable: /bin/bash
+      changed_when: true
+      become: true
+      when: (target.benchmark_engine | default('locust')) == 'locust'
+
+- name: Run Locust master headlessly
+  hosts: master
+  gather_facts: false
+  vars:
+    target: "{{ hostvars['runtime_target'].target_state }}"
+    remote_result_dir: "/var/lib/octavia-perf/results/{{ target.benchmark_id }}"
+    total_workers: "{{ (vm.locust.worker_vms | int) * (vm.locust.processes_per_vm | int) }}"
+    stages_json: "{{ locust.stages | to_json }}"
+    max_rps_json: "{{ max_rps | default({}) | to_json }}"
+  tasks:
+    - name: Run Locust master
+      ansible.builtin.shell: |
+        set -euo pipefail
+        export OCTAVIA_PERF_PATH={{ target.benchmark_path | quote }}
+        export OCTAVIA_PERF_STAGES={{ stages_json | quote }}
+        export OCTAVIA_PERF_TIMEOUT={{ locust.request_timeout_seconds | quote }}
+        export OCTAVIA_PERF_CONNECTION_MODE={{ target.connection_mode | quote }}
+        export OCTAVIA_PERF_LOCUST_PROFILE={{ target.locust_profile | default('staircase') | quote }}
+        export OCTAVIA_PERF_MAX_RPS={{ max_rps_json | quote }}
+        export OCTAVIA_PERF_MAX_RPS_OUTPUT={{ (remote_result_dir + '/max-rps-stages.csv') | quote }}
+        export OCTAVIA_PERF_TLS_INSECURE={{ (tls.client_insecure | default(true) | bool) | ternary('true', 'false') | quote }}
+        /opt/octavia-perf/venv/bin/locust \
+          -f /opt/octavia-perf/locustfile.py \
+          --master \
+          --headless \
+          --expect-workers {{ total_workers }} \
+          --host {{ target.target_url | quote }} \
+          --stop-timeout {{ locust.stop_timeout_seconds }} \
+          --csv {{ remote_result_dir }}/locust \
+          --csv-full-history \
+          >{{ remote_result_dir }}/locust.log 2>&1
+      args:
+        executable: /bin/bash
+      become: true
+      register: locust_master_run
+      failed_when: locust_master_run.rc not in [0, 1]
+      changed_when: true
+      when: (target.benchmark_engine | default('locust')) == 'locust'
+    - name: Report Locust completion status
+      ansible.builtin.debug:
+        msg: >-
+          Locust completed with rc={{ locust_master_run.rc }}.
+          {{ 'Request failures/errors were recorded; result collection will continue.' if locust_master_run.rc == 1 else 'No Locust failure exit code was reported.' }}
+      when:
+        - (target.benchmark_engine | default('locust')) == 'locust'
+        - locust_master_run is defined
+
+- name: Preflight connection-capacity client path
+  hosts: locust_workers
+  gather_facts: false
+  vars:
+    target: "{{ hostvars['runtime_target'].target_state }}"
+    remote_result_dir: "/var/lib/octavia-perf/results/{{ target.benchmark_id }}"
+  tasks:
+    - name: Verify one connection can be established and held
+      ansible.builtin.shell: |
+        set -euo pipefail
+        preflight_dir={{ (remote_result_dir + '/preflight') | quote }}
+        mkdir -p "$preflight_dir"
+        cmd=(
+          /opt/octavia-perf/connection_capacity.py
+          --target-url {{ target.target_url | quote }}
+          --path {{ target.benchmark_path | quote }}
+          --capacity-mode {{ target.capacity_mode | quote }}
+          --levels 1
+          --worker-index 0
+          --worker-count 1
+          --ramp-seconds 1
+          --hold-seconds 2
+          --heartbeat-seconds 1
+          --inter-level-cooldown-seconds 0
+          --connect-timeout {{ connection_capacity.connect_timeout_seconds | quote }}
+          --request-timeout {{ connection_capacity.request_timeout_seconds | quote }}
+          --open-concurrency 1
+          --io-concurrency 1
+          --start-epoch 0
+          --output-dir "$preflight_dir"
+          --output-prefix preflight
+        )
+        {% if tls.client_insecure | default(true) | bool %}cmd+=(--insecure){% endif %}
+        {% if connection_capacity.abortive_close | default(true) | bool %}cmd+=(--abortive-close){% endif %}
+        {% if connection_capacity.verify_idle_at_end | default(true) | bool %}cmd+=(--verify-idle-at-end){% endif %}
+        {% if connection_capacity.tcp_nodelay | default(true) | bool %}cmd+=(--tcp-nodelay){% endif %}
+        printf 'capacity preflight command:'
+        printf ' %q' "${cmd[@]}"
+        printf '\n'
+        "${cmd[@]}" >"$preflight_dir/preflight.log" 2>&1 || {
+          cat "$preflight_dir/preflight.log"
+          exit 1
+        }
+        /usr/bin/python3 - \
+          "$preflight_dir/connection-capacity-preflight.csv" \
+          "$preflight_dir/connection-errors-preflight.csv" <<'PY'
+        import csv
+        import sys
+        summary_path, errors_path = sys.argv[1:3]
+        with open(summary_path, newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        errors = []
+        try:
+            with open(errors_path, newline="") as stream:
+                errors = list(csv.DictReader(stream))
+        except FileNotFoundError:
+            pass
+        if len(rows) != 1:
+            raise SystemExit(f"capacity preflight expected one summary row, found {len(rows)}")
+        row = rows[0]
+        established = int(row.get("established") or 0)
+        surviving = int(row.get("surviving") or 0)
+        if established != 1 or surviving != 1:
+            raise SystemExit(
+                "capacity preflight failed: "
+                f"established={established}/1 surviving={surviving}/1 errors={errors}"
+            )
+        print("capacity preflight passed: established=1/1 surviving=1/1")
+        PY
+      args:
+        executable: /bin/bash
+      become: true
+      run_once: true
+      register: capacity_preflight
+      failed_when: false
+      changed_when: true
+      when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
+    - name: Store preflight result for subsequent plays
+      ansible.builtin.set_fact:
+        capacity_preflight_failed: "{{ (capacity_preflight.rc | default(0) | int) != 0 }}"
+      when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
+    - name: Report preflight failure without skipping cleanup
+      ansible.builtin.debug:
+        msg: "Capacity preflight failed (rc={{ capacity_preflight.rc }}); skipping capacity workers, retaining diagnostics for collection."
+      when:
+        - (target.benchmark_engine | default('locust')) == 'connection_capacity'
+        - capacity_preflight_failed | default(false) | bool
+
+- name: Prepare synchronized connection-capacity start
+  hosts: localhost
+  gather_facts: false
+  vars:
+    target: "{{ hostvars['runtime_target'].target_state }}"
+  tasks:
+    - name: Set a common future start epoch for all capacity processes
+      ansible.builtin.add_host:
+        name: runtime_target
+        target_state: "{{ target }}"
+        connection_start_epoch: >-
+          {{ (lookup('pipe', 'date +%s') | int) + ((connection_capacity | default({})).sync_start_delay_seconds | default(8) | int) }}
+      when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
+
+- name: Run distributed concurrent-connection capacity workers
+  hosts: locust_workers
+  gather_facts: false
+  vars:
+    target: "{{ hostvars['runtime_target'].target_state }}"
+    remote_result_dir: "/var/lib/octavia-perf/results/{{ target.benchmark_id }}"
+    levels_csv: "{{ connection_capacity.levels | map('string') | join(',') }}"
+    max_levels_per_worker_csv: "{{ connection_capacity.max_levels_per_worker | default([]) | map('string') | join(',') }}"
+    capacity_processes_per_vm: "{{ connection_capacity.processes_per_vm | default(2) | int }}"
+    capacity_total_processes: "{{ (vm.locust.worker_vms | int) * (connection_capacity.processes_per_vm | default(2) | int) }}"
+    capacity_vm_index: "{{ groups['locust_workers'].index(inventory_hostname) }}"
+  tasks:
+    - name: Stop stale capacity workers
+      ansible.builtin.shell: "pkill -f '[c]onnection_capacity.py' || true"
+      changed_when: false
+      become: true
+      when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
+    - name: Run capacity worker processes
+      ansible.builtin.shell: |
+        set -euo pipefail
+        ulimit -n {{ connection_capacity.file_descriptor_limit | int }}
+        pids=()
+        if [[ {{ (target.capacity_profile | default('standard')) | quote }} == "max" ]]; then
+          levels_csv=$(/usr/bin/python3 -c 'import sys; w=int(sys.argv[1]); print(",".join(str(int(x)*w) for x in sys.argv[2].split(",") if x))' {{ vm.locust.worker_vms | int }} {{ max_levels_per_worker_csv | quote }})
+        else
+          levels_csv={{ levels_csv | quote }}
+        fi
+        vm_index={{ capacity_vm_index | int }}
+        processes={{ capacity_processes_per_vm | int }}
+        total_processes={{ capacity_total_processes | int }}
+        for ((p=0; p<processes; p++)); do
+          shard=$((vm_index * processes + p))
+          prefix=$(printf 'p%02d' "$p")
+          cmd=(
+            /opt/octavia-perf/connection_capacity.py
+            --target-url {{ target.target_url | quote }}
+            --path {{ target.benchmark_path | quote }}
+            --capacity-mode {{ target.capacity_mode | quote }}
+            --levels "$levels_csv"
+            --worker-index "$shard"
+            --worker-count "$total_processes"
+            --ramp-seconds {{ connection_capacity.ramp_seconds | quote }}
+            --hold-seconds {{ connection_capacity.hold_seconds | quote }}
+            --heartbeat-seconds {{ connection_capacity.heartbeat_seconds | quote }}
+            --inter-level-cooldown-seconds {{ connection_capacity.inter_level_cooldown_seconds | quote }}
+            --connect-timeout {{ connection_capacity.connect_timeout_seconds | quote }}
+            --request-timeout {{ connection_capacity.request_timeout_seconds | quote }}
+            --open-concurrency {{ connection_capacity.open_concurrency_per_worker | quote }}
+            --io-concurrency {{ connection_capacity.io_concurrency_per_worker | quote }}
+            --start-epoch {{ hostvars['runtime_target'].connection_start_epoch | quote }}
+            --output-dir {{ remote_result_dir | quote }}
+            --output-prefix "$prefix"
+          )
+          {% if tls.client_insecure | default(true) | bool %}cmd+=(--insecure){% endif %}
+          {% if connection_capacity.abortive_close | default(true) | bool %}cmd+=(--abortive-close){% endif %}
+          {% if connection_capacity.verify_idle_at_end | default(true) | bool %}cmd+=(--verify-idle-at-end){% endif %}
+          {% if connection_capacity.tcp_nodelay | default(true) | bool %}cmd+=(--tcp-nodelay){% endif %}
+          printf 'capacity worker command:'
+          printf ' %q' "${cmd[@]}"
+          printf '\n'
+          "${cmd[@]}" >{{ remote_result_dir }}/connection-capacity-${prefix}.log 2>&1 &
+          pids+=("$!")
+        done
+        rc=0
+        for idx in "${!pids[@]}"; do
+          worker_rc=0
+          wait "${pids[$idx]}" || worker_rc=$?
+          printf '%s\n' "$worker_rc" >{{ remote_result_dir }}/connection-capacity-$(printf 'p%02d' "$idx").exitcode
+          if (( worker_rc != 0 )); then rc=1; fi
+        done
+        exit "$rc"
+      args:
+        executable: /bin/bash
+      become: true
+      register: capacity_run
+      failed_when: false
+      changed_when: true
+      when:
+        - (target.benchmark_engine | default('locust')) == 'connection_capacity'
+        - not (hostvars[groups['locust_workers'][0]].capacity_preflight_failed | default(false) | bool)
+    - name: Persist capacity runner status
+      ansible.builtin.copy:
+        content: "{{ capacity_run.rc | default('skipped') }}\n"
+        dest: "{{ remote_result_dir }}/capacity-runner.exitcode"
+        mode: '0644'
+      become: true
+      when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
+
+- name: Stop samplers and workers
+  hosts: benchmark_nodes
+  gather_facts: false
+  vars:
+    target: "{{ hostvars['runtime_target'].target_state }}"
+  tasks:
+    - name: Stop metrics sampler
+      ansible.builtin.shell: "pkill -f '[m]etrics_sampler.py' || true"
+      changed_when: false
+      become: true
+    - name: Stop Locust worker processes
+      ansible.builtin.shell: "pkill -f '[l]ocust.*--worker' || true"
+      changed_when: false
+      become: true
+      when:
+        - inventory_hostname in groups['locust_workers']
+        - (target.benchmark_engine | default('locust')) == 'locust'
+    - name: Stop any remaining capacity workers
+      ansible.builtin.shell: "pkill -f '[c]onnection_capacity.py' || true"
+      changed_when: false
+      become: true
+      when:
+        - inventory_hostname in groups['locust_workers']
+        - (target.benchmark_engine | default('locust')) == 'connection_capacity'
+
+- name: Restore temporary FIP benchmark routes
+  hosts: master:locust_workers
+  gather_facts: false
+  vars:
+    target: "{{ hostvars['runtime_target'].target_state }}"
+    route_state_file: "/var/lib/octavia-perf/fip-route-{{ target.target_host }}.json"
+  tasks:
+    - name: Restore route after floating-IP benchmark
+      ansible.builtin.command:
+        argv:
+          - /opt/octavia-perf/controller_fip_route.py
+          - restore
+          - --state-file
+          - "{{ route_state_file }}"
+      become: true
+      changed_when: true
+      failed_when: false
+      when: (target.traffic_path | default('tenant_vip')) == 'floating_ip'
