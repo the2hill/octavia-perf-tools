@@ -168,10 +168,15 @@
     target: "{{ hostvars['runtime_target'].target_state }}"
     remote_result_dir: "/var/lib/octavia-perf/results/{{ target.benchmark_id }}"
   tasks:
+    - name: Stop stale capacity clients before preflight
+      ansible.builtin.shell: "pkill -f '[c]onnection_capacity.py' || true"
+      changed_when: false
+      become: true
+      when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
     - name: Verify one connection can be established and held
       ansible.builtin.shell: |
         set -euo pipefail
-        preflight_dir={{ (remote_result_dir + '/preflight') | quote }}
+        preflight_dir={{ remote_result_dir | quote }}
         mkdir -p "$preflight_dir"
         cmd=(
           /opt/octavia-perf/connection_capacity.py
@@ -200,10 +205,14 @@
         printf 'capacity preflight command:'
         printf ' %q' "${cmd[@]}"
         printf '\n'
-        "${cmd[@]}" >"$preflight_dir/preflight.log" 2>&1 || {
+        client_rc=0
+        "${cmd[@]}" >"$preflight_dir/preflight.log" 2>&1 || client_rc=$?
+        if (( client_rc != 0 )); then
           cat "$preflight_dir/preflight.log"
-          exit 1
-        }
+          printf '%s\n' "$client_rc" >"$preflight_dir/preflight.exitcode"
+          exit "$client_rc"
+        fi
+        set +e
         /usr/bin/python3 - \
           "$preflight_dir/connection-capacity-preflight.csv" \
           "$preflight_dir/connection-errors-preflight.csv" <<'PY'
@@ -230,6 +239,9 @@
             )
         print("capacity preflight passed: established=1/1 surviving=1/1")
         PY
+        validation_rc=$?
+        printf '%s\n' "$validation_rc" >"$preflight_dir/preflight.exitcode"
+        exit "$validation_rc"
       args:
         executable: /bin/bash
       become: true
@@ -237,6 +249,20 @@
       register: capacity_preflight
       failed_when: false
       changed_when: true
+      when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
+    - name: Fetch preflight diagnostics to controller even when validation fails
+      ansible.builtin.fetch:
+        src: "{{ remote_result_dir }}/{{ item }}"
+        dest: "{{ playbook_dir }}/../results/{{ target.benchmark_id }}/raw/{{ inventory_hostname }}/{{ item }}"
+        flat: true
+        fail_on_missing: false
+      become: true
+      run_once: true
+      loop:
+        - preflight.log
+        - preflight.exitcode
+        - connection-capacity-preflight.csv
+        - connection-errors-preflight.csv
       when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
     - name: Store preflight result for subsequent plays
       ansible.builtin.set_fact:
@@ -275,11 +301,6 @@
     capacity_total_processes: "{{ (vm.locust.worker_vms | int) * (connection_capacity.processes_per_vm | default(2) | int) }}"
     capacity_vm_index: "{{ groups['locust_workers'].index(inventory_hostname) }}"
   tasks:
-    - name: Stop stale capacity workers
-      ansible.builtin.shell: "pkill -f '[c]onnection_capacity.py' || true"
-      changed_when: false
-      become: true
-      when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
     - name: Run capacity worker processes
       ansible.builtin.shell: |
         set -euo pipefail
@@ -348,6 +369,24 @@
         content: "{{ capacity_run.rc | default('skipped') }}\n"
         dest: "{{ remote_result_dir }}/capacity-runner.exitcode"
         mode: '0644'
+      become: true
+      when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
+
+    - name: Fetch capacity worker diagnostics
+      ansible.builtin.fetch:
+        src: "{{ remote_result_dir }}/{{ item.0 }}{{ item.1 }}"
+        dest: "{{ playbook_dir }}/../results/{{ target.benchmark_id }}/raw/{{ inventory_hostname }}/{{ item.0 }}{{ item.1 }}"
+        flat: true
+        fail_on_missing: false
+      become: true
+      loop: "{{ ['connection-capacity-p00', 'connection-capacity-p01', 'connection-capacity-p02', 'connection-capacity-p03'] | product(['.log', '.exitcode']) | list }}"
+      when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
+    - name: Fetch capacity runner exit status
+      ansible.builtin.fetch:
+        src: "{{ remote_result_dir }}/capacity-runner.exitcode"
+        dest: "{{ playbook_dir }}/../results/{{ target.benchmark_id }}/raw/{{ inventory_hostname }}/capacity-runner.exitcode"
+        flat: true
+        fail_on_missing: false
       become: true
       when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
 
