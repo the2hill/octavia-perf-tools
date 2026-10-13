@@ -75,6 +75,7 @@ def write_run_failure(
         .isoformat(),
         "stage": stage,
         "returncode": exc.returncode,
+        "run_test_log": str(result_dir / "orchestration" / "run_test.log") if stage == "run_test" else None,
         "command": [str(x) for x in (exc.cmd if isinstance(exc.cmd, (list, tuple)) else [exc.cmd])],
     }
     (result_dir / "RUN_FAILED.yml").write_text(
@@ -85,7 +86,7 @@ def write_run_failure(
 def generate_report_best_effort(result_dir: pathlib.Path) -> bool:
     """Generate reporting artifacts without reclassifying a completed load test as failed."""
     try:
-        run(str(PYTHON), "scripts/report.py", str(result_dir))
+        run(str(PYTHON), "scripts/report.py", str(result_dir), log_path=result_dir / "orchestration" / "report.log")
         return True
     except subprocess.CalledProcessError as exc:
         failure = {
@@ -94,6 +95,7 @@ def generate_report_best_effort(result_dir: pathlib.Path) -> bool:
             .isoformat(),
             "stage": "report",
             "returncode": exc.returncode,
+            "report_log": str(result_dir / "orchestration" / "report.log"),
             "command": [
                 str(x)
                 for x in (
@@ -124,11 +126,8 @@ def collect_lb_failure_diagnostics(
     lb_name: str,
     attempt: int,
     result_dir: pathlib.Path,
-    artifact_name: str | None = None,
 ) -> None:
-    output = result_dir / "orchestration" / (
-        artifact_name or f"lb-create-attempt-{attempt:02d}-diagnostics.json"
-    )
+    output = result_dir / "orchestration" / f"lb-create-attempt-{attempt:02d}-diagnostics.json"
     cmd = [
         str(PYTHON),
         "scripts/lb_failure_diagnostics.py",
@@ -147,134 +146,6 @@ def collect_lb_failure_diagnostics(
             f"(rc={diag_exc.returncode}); continuing with cleanup/retry.",
             flush=True,
         )
-
-
-def resource_parent_load_balancer_ids(resource: Any) -> set[str]:
-    ids: set[str] = set()
-    for attr in ("loadbalancer_id", "load_balancer_id"):
-        value = getattr(resource, attr, None)
-        if value:
-            ids.add(str(value))
-    for attr in ("loadbalancers", "load_balancers"):
-        for item in getattr(resource, attr, None) or []:
-            value = item.get("id") if isinstance(item, dict) else getattr(item, "id", None)
-            if value:
-                ids.add(str(value))
-    return ids
-
-
-def campaign_scenario_health(
-    config: pathlib.Path,
-    *,
-    flavor: str,
-    campaign_id: str,
-    scenario_name: str,
-    wait_seconds: float = 60.0,
-) -> tuple[bool, str]:
-    """Verify an ACTIVE persistent LB with no remnants from ``scenario_name``."""
-    state_path = campaign_lb_state_path(flavor, campaign_id)
-    if not state_path.exists():
-        return False, f"campaign state file is missing: {state_path}"
-    state = yaml.safe_load(state_path.read_text()) or {}
-    lb_id = str(state.get("load_balancer_id") or "")
-    if not lb_id:
-        return False, "campaign state does not contain load_balancer_id"
-
-    cfg = yaml.safe_load(config.read_text()) or {}
-    cloud_cfg = cfg.get("openstack") or {}
-    cloud = cloud_cfg.get("cloud")
-    region = str(cloud_cfg.get("region_name") or "") or None
-    if not cloud:
-        return False, "openstack.cloud is missing"
-
-    scenario_slug = slug(scenario_name)
-    lb_name = str(
-        state.get("load_balancer_name")
-        or campaign_lb_name(config, flavor, campaign_id)
-    )
-    listener_name = f"{lb_name}-{scenario_slug}-listener"
-    pool_name = f"{lb_name}-{scenario_slug}-pool"
-
-    try:
-        conn = openstack_connect(cloud, region)
-    except Exception as exc:
-        return False, f"unable to connect to OpenStack: {type(exc).__name__}: {exc}"
-
-    deadline = time.monotonic() + max(0.0, wait_seconds)
-    last_reason = "cleanup verification did not run"
-    while True:
-        try:
-            lb = conn.load_balancer.get_load_balancer(lb_id)
-        except Exception as exc:
-            return False, f"unable to read campaign LB {lb_id}: {type(exc).__name__}: {exc}"
-
-        status = str(getattr(lb, "provisioning_status", None) or "")
-        if status == "ERROR":
-            return False, f"campaign LB {lb_id} is in ERROR"
-
-        if status == "ACTIVE":
-            try:
-                listeners = [
-                    item
-                    for item in conn.load_balancer.listeners()
-                    if lb_id in resource_parent_load_balancer_ids(item)
-                    and str(getattr(item, "name", "")) == listener_name
-                ]
-                pools = [
-                    item
-                    for item in conn.load_balancer.pools()
-                    if lb_id in resource_parent_load_balancer_ids(item)
-                    and str(getattr(item, "name", "")) == pool_name
-                ]
-            except Exception as exc:
-                return False, f"unable to verify scenario cleanup: {type(exc).__name__}: {exc}"
-
-            remnants = []
-            if listeners:
-                remnants.append(f"listener={listener_name}")
-            if pools:
-                remnants.append(f"pool={pool_name}")
-            if not remnants:
-                return True, f"campaign LB {lb_id} is ACTIVE and scenario children are absent"
-            last_reason = "scenario cleanup left child resources: " + ", ".join(remnants)
-        else:
-            last_reason = (
-                f"campaign LB {lb_id} did not return ACTIVE; "
-                f"status={status or '<unknown>'}"
-            )
-
-        if time.monotonic() >= deadline:
-            return False, last_reason
-        time.sleep(2)
-
-
-def cleanup_campaign_scenario(
-    config: pathlib.Path,
-    *,
-    flavor: str,
-    scenario_name: str,
-    campaign_id: str,
-    setup_common: dict[str, str],
-    result_dir: pathlib.Path,
-    log_name: str,
-) -> tuple[bool, str]:
-    cleanup_log = result_dir / "orchestration" / log_name
-    try:
-        ansible(
-            "playbooks/destroy_campaign_lb_scenario.yml",
-            config,
-            log_path=cleanup_log,
-            **setup_common,
-        )
-    except subprocess.CalledProcessError as exc:
-        return False, f"scenario cleanup playbook failed rc={exc.returncode}"
-
-    return campaign_scenario_health(
-        config,
-        flavor=flavor,
-        campaign_id=campaign_id,
-        scenario_name=scenario_name,
-    )
 
 
 def cleanup_failed_lb(
@@ -436,7 +307,7 @@ def one_run(
 
         stage = "run_test"
         load_started = dt.datetime.now(dt.timezone.utc)
-        ansible("playbooks/run_test.yml", config, **common)
+        ansible("playbooks/run_test.yml", config, log_path=result_dir / "orchestration" / "run_test.log", **common)
         load_completed = dt.datetime.now(dt.timezone.utc)
         timing = {
             "orchestration_started_at_utc": orchestration_started.replace(microsecond=0).isoformat(),
@@ -453,6 +324,15 @@ def one_run(
         generate_report_best_effort(result_dir)
         stage = "complete"
     except subprocess.CalledProcessError as exc:
+        if stage == "run_test":
+            try:
+                ansible(
+                    "playbooks/collect.yml", config,
+                    log_path=result_dir / "orchestration" / "collect-after-failure.log",
+                    **common,
+                )
+            except subprocess.CalledProcessError as collect_exc:
+                print(f"WARNING: collection after run_test failure returned rc={collect_exc.returncode}", flush=True)
         write_run_failure(result_dir, stage=stage, exc=exc)
         if target_kind == "octavia" and reuse_campaign_lb and campaign_id is not None:
             try:
@@ -545,7 +425,7 @@ def run_preconfigured_campaign_rep(
 
         stage = "run_test"
         load_started = dt.datetime.now(dt.timezone.utc)
-        ansible("playbooks/run_test.yml", config, **common)
+        ansible("playbooks/run_test.yml", config, log_path=result_dir / "orchestration" / "run_test.log", **common)
         load_completed = dt.datetime.now(dt.timezone.utc)
         timing = {
             "orchestration_started_at_utc": orchestration_started.replace(microsecond=0).isoformat(),
@@ -565,6 +445,15 @@ def run_preconfigured_campaign_rep(
         generate_report_best_effort(result_dir)
         stage = "complete"
     except subprocess.CalledProcessError as exc:
+        if stage == "run_test":
+            try:
+                ansible(
+                    "playbooks/collect.yml", config,
+                    log_path=result_dir / "orchestration" / "collect-after-failure.log",
+                    **common,
+                )
+            except subprocess.CalledProcessError as collect_exc:
+                print(f"WARNING: collection after run_test failure returned rc={collect_exc.returncode}", flush=True)
         write_run_failure(result_dir, stage=stage, exc=exc)
         try:
             collect_lb_failure_diagnostics(
@@ -963,14 +852,6 @@ def main() -> None:
         raise SystemExit("--lb-create-attempts must be >= 1")
     if lb_create_retry_delay_seconds < 0:
         raise SystemExit("--lb-create-retry-delay-seconds must be >= 0")
-    scenario_setup_attempts = int(campaign.get("scenario_setup_attempts", 2))
-    scenario_setup_retry_delay_seconds = float(
-        campaign.get("scenario_setup_retry_delay_seconds", 10)
-    )
-    if scenario_setup_attempts < 1:
-        raise SystemExit("campaign.scenario_setup_attempts must be >= 1")
-    if scenario_setup_retry_delay_seconds < 0:
-        raise SystemExit("campaign.scenario_setup_retry_delay_seconds must be >= 0")
 
     run(str(PYTHON), "scripts/validate_config.py", str(config))
 
@@ -981,7 +862,6 @@ def main() -> None:
         or dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     )
     prepared_campaign_flavors: set[str] = set()
-    unhealthy_campaign_flavors: set[str] = set()
     first = True
 
     def cool_down() -> None:
@@ -1095,7 +975,7 @@ def main() -> None:
                             lb_create_retry_delay_seconds=lb_create_retry_delay_seconds,
                         )
                         prepared_campaign_flavors.add(flavor)
-                    except (subprocess.CalledProcessError, RuntimeError) as exc:
+                    except subprocess.CalledProcessError as exc:
                         failure = {
                             "failed_at_utc": dt.datetime.now(dt.timezone.utc)
                             .replace(microsecond=0)
@@ -1104,16 +984,15 @@ def main() -> None:
                             "flavor": flavor,
                             "scenario": None,
                             "repetition": None,
-                            "returncode": getattr(exc, "returncode", 1),
+                            "returncode": exc.returncode,
                             "command": [
                                 str(x)
                                 for x in (
                                     exc.cmd
-                                    if isinstance(getattr(exc, "cmd", None), (list, tuple))
-                                    else ([exc.cmd] if getattr(exc, "cmd", None) is not None else [])
+                                    if isinstance(exc.cmd, (list, tuple))
+                                    else [exc.cmd]
                                 )
                             ],
-                            "error": str(exc),
                         }
                         failures.append(failure)
                         if not args.continue_on_error:
@@ -1157,14 +1036,6 @@ def main() -> None:
                     random.shuffle(scenario_schedule)
 
                 for flavor, scenario_name in scenario_schedule:
-                    if flavor in unhealthy_campaign_flavors:
-                        print(
-                            "\nSKIP SCENARIO: "
-                            f"flavor={flavor} scenario={scenario_name}; persistent LB was marked unhealthy",
-                            flush=True,
-                        )
-                        continue
-
                     setup_dir = scenario_setup_result_dir(
                         campaign_id, flavor, scenario_name
                     )
@@ -1178,115 +1049,40 @@ def main() -> None:
                         "suite_id": campaign_id,
                     }
                     scenario_configured = False
-                    setup_error: subprocess.CalledProcessError | None = None
 
                     print(
                         "\nCONFIGURE SCENARIO ONCE: "
                         f"flavor={flavor} scenario={scenario_name} repetitions={repetitions}",
                         flush=True,
                     )
-
-                    for setup_attempt in range(1, scenario_setup_attempts + 1):
-                        setup_log = (
-                            setup_dir
-                            / "orchestration"
-                            / f"configure-campaign-lb-scenario-attempt-{setup_attempt:02d}.log"
-                        )
+                    try:
                         try:
                             ansible(
                                 "playbooks/configure_campaign_lb_scenario.yml",
                                 config,
-                                log_path=setup_log,
                                 **setup_common,
                             )
                             scenario_configured = True
-                            setup_error = None
-                            break
                         except subprocess.CalledProcessError as exc:
-                            setup_error = exc
-                            attempt_failure = {
-                                "failed_at_utc": dt.datetime.now(dt.timezone.utc)
-                                .replace(microsecond=0)
-                                .isoformat(),
-                                "stage": "configure_campaign_lb_scenario",
-                                "attempt": setup_attempt,
-                                "returncode": exc.returncode,
-                                "command": [
-                                    str(x)
-                                    for x in (
-                                        exc.cmd if isinstance(exc.cmd, (list, tuple)) else [exc.cmd]
-                                    )
-                                ],
-                            }
-                            (
-                                setup_dir
-                                / f"SETUP_ATTEMPT_{setup_attempt:02d}_FAILED.yml"
-                            ).write_text(
-                                yaml.safe_dump(attempt_failure, sort_keys=False),
-                                encoding="utf-8",
+                            write_run_failure(
+                                setup_dir,
+                                stage="configure_campaign_lb_scenario",
+                                exc=exc,
                             )
                             try:
                                 collect_lb_failure_diagnostics(
                                     config,
-                                    lb_name=campaign_lb_name(config, flavor, campaign_id),
-                                    attempt=setup_attempt,
-                                    result_dir=setup_dir,
-                                    artifact_name=(
-                                        f"scenario-setup-attempt-{setup_attempt:02d}-diagnostics.json"
+                                    lb_name=campaign_lb_name(
+                                        config, flavor, campaign_id
                                     ),
+                                    attempt=1,
+                                    result_dir=setup_dir,
                                 )
                             except Exception as diag_exc:
                                 print(
                                     f"WARNING: persistent LB diagnostics failed: {diag_exc}",
                                     flush=True,
                                 )
-
-                            print(
-                                "FAILED SCENARIO SETUP ATTEMPT: "
-                                f"flavor={flavor} scenario={scenario_name} "
-                                f"attempt={setup_attempt}/{scenario_setup_attempts} "
-                                f"rc={exc.returncode}",
-                                flush=True,
-                            )
-                            cleanup_ok, cleanup_reason = cleanup_campaign_scenario(
-                                config,
-                                flavor=flavor,
-                                scenario_name=scenario_name,
-                                campaign_id=campaign_id,
-                                setup_common=setup_common,
-                                result_dir=setup_dir,
-                                log_name=(
-                                    f"cleanup-after-setup-attempt-{setup_attempt:02d}.log"
-                                ),
-                            )
-                            print(
-                                f"Scenario recovery cleanup: {cleanup_reason}",
-                                flush=True,
-                            )
-                            if not cleanup_ok:
-                                unhealthy_campaign_flavors.add(flavor)
-                                print(
-                                    f"WARNING: flavor {flavor} persistent LB is unhealthy after "
-                                    "scenario setup failure; remaining scenarios for this flavor will be skipped.",
-                                    flush=True,
-                                )
-                                break
-                            if setup_attempt < scenario_setup_attempts:
-                                if scenario_setup_retry_delay_seconds > 0:
-                                    print(
-                                        "Retrying scenario setup after "
-                                        f"{scenario_setup_retry_delay_seconds:g}s...",
-                                        flush=True,
-                                    )
-                                    time.sleep(scenario_setup_retry_delay_seconds)
-
-                    if not scenario_configured:
-                        if setup_error is not None:
-                            write_run_failure(
-                                setup_dir,
-                                stage="configure_campaign_lb_scenario",
-                                exc=setup_error,
-                            )
                             failure = {
                                 "failed_at_utc": dt.datetime.now(dt.timezone.utc)
                                 .replace(microsecond=0)
@@ -1295,109 +1091,99 @@ def main() -> None:
                                 "flavor": flavor,
                                 "scenario": scenario_name,
                                 "repetition": None,
-                                "returncode": setup_error.returncode,
+                                "returncode": exc.returncode,
                                 "command": [
                                     str(x)
                                     for x in (
-                                        setup_error.cmd
-                                        if isinstance(setup_error.cmd, (list, tuple))
-                                        else [setup_error.cmd]
+                                        exc.cmd
+                                        if isinstance(exc.cmd, (list, tuple))
+                                        else [exc.cmd]
                                     )
                                 ],
                             }
                             failures.append(failure)
-                        print(
-                            "\nFAILED SCENARIO SETUP: "
-                            f"flavor={flavor} scenario={scenario_name}",
-                            flush=True,
-                        )
-                        if not args.continue_on_error and setup_error is not None:
-                            raise setup_error
-                        continue
+                            print(
+                                "\nFAILED SCENARIO SETUP: "
+                                f"flavor={flavor} scenario={scenario_name} "
+                                f"rc={exc.returncode}",
+                                flush=True,
+                            )
+                            if not args.continue_on_error:
+                                raise
+                            print(
+                                "Skipping repetitions for this flavor/scenario and "
+                                "continuing with the campaign.",
+                                flush=True,
+                            )
 
-                    try:
-                        for rep in range(1, repetitions + 1):
-                            cool_down()
-                            try:
-                                outputs.append(
-                                    run_preconfigured_campaign_rep(
-                                        config,
-                                        flavor,
-                                        scenario_name,
-                                        rep,
-                                        campaign_id=campaign_id,
-                                        suite_id=campaign_id,
-                                    )
-                                )
-                            except subprocess.CalledProcessError as exc:
-                                failure = {
-                                    "failed_at_utc": dt.datetime.now(dt.timezone.utc)
-                                    .replace(microsecond=0)
-                                    .isoformat(),
-                                    "target_kind": "octavia",
-                                    "flavor": flavor,
-                                    "scenario": scenario_name,
-                                    "repetition": rep,
-                                    "returncode": exc.returncode,
-                                    "command": [
-                                        str(x)
-                                        for x in (
-                                            exc.cmd
-                                            if isinstance(exc.cmd, (list, tuple))
-                                            else [exc.cmd]
+                        if scenario_configured:
+                            for rep in range(1, repetitions + 1):
+                                cool_down()
+                                try:
+                                    outputs.append(
+                                        run_preconfigured_campaign_rep(
+                                            config,
+                                            flavor,
+                                            scenario_name,
+                                            rep,
+                                            campaign_id=campaign_id,
+                                            suite_id=campaign_id,
                                         )
-                                    ],
-                                }
-                                failures.append(failure)
-                                print(
-                                    "\nFAILED RUN: "
-                                    f"target=octavia flavor={flavor} "
-                                    f"scenario={scenario_name} r{rep:02d} "
-                                    f"rc={exc.returncode}",
-                                    flush=True,
-                                )
-                                if not args.continue_on_error:
-                                    raise
-                                print(
-                                    "Keeping the configured scenario and continuing "
-                                    "with the remaining repetitions.",
-                                    flush=True,
-                                )
+                                    )
+                                except subprocess.CalledProcessError as exc:
+                                    failure = {
+                                        "failed_at_utc": dt.datetime.now(dt.timezone.utc)
+                                        .replace(microsecond=0)
+                                        .isoformat(),
+                                        "target_kind": "octavia",
+                                        "flavor": flavor,
+                                        "scenario": scenario_name,
+                                        "repetition": rep,
+                                        "returncode": exc.returncode,
+                                        "command": [
+                                            str(x)
+                                            for x in (
+                                                exc.cmd
+                                                if isinstance(exc.cmd, (list, tuple))
+                                                else [exc.cmd]
+                                            )
+                                        ],
+                                    }
+                                    failures.append(failure)
+                                    print(
+                                        "\nFAILED RUN: "
+                                        f"target=octavia flavor={flavor} "
+                                        f"scenario={scenario_name} r{rep:02d} "
+                                        f"rc={exc.returncode}",
+                                        flush=True,
+                                    )
+                                    if not args.continue_on_error:
+                                        raise
+                                    print(
+                                        "Keeping the configured scenario and continuing "
+                                        "with the remaining repetitions.",
+                                        flush=True,
+                                    )
                     finally:
+                        # Always attempt one scenario cleanup, even when configuration only
+                        # partially completed. The playbook is intentionally idempotent and
+                        # uses failed_when=false for absent child resources.
                         print(
                             "CLEAN UP SCENARIO ONCE: "
                             f"flavor={flavor} scenario={scenario_name}",
                             flush=True,
                         )
-                        cleanup_ok, cleanup_reason = cleanup_campaign_scenario(
-                            config,
-                            flavor=flavor,
-                            scenario_name=scenario_name,
-                            campaign_id=campaign_id,
-                            setup_common=setup_common,
-                            result_dir=setup_dir,
-                            log_name="final-scenario-cleanup.log",
-                        )
-                        print(f"Scenario cleanup verification: {cleanup_reason}", flush=True)
-                        if not cleanup_ok:
-                            unhealthy_campaign_flavors.add(flavor)
-                            failures.append(
-                                {
-                                    "failed_at_utc": dt.datetime.now(dt.timezone.utc)
-                                    .replace(microsecond=0)
-                                    .isoformat(),
-                                    "target_kind": "octavia_scenario_cleanup",
-                                    "flavor": flavor,
-                                    "scenario": scenario_name,
-                                    "repetition": None,
-                                    "returncode": 1,
-                                    "command": [],
-                                    "error": cleanup_reason,
-                                }
+                        try:
+                            ansible(
+                                "playbooks/destroy_campaign_lb_scenario.yml",
+                                config,
+                                **setup_common,
                             )
+                        except subprocess.CalledProcessError as cleanup_exc:
                             print(
-                                f"WARNING: flavor {flavor} persistent LB is unhealthy after cleanup; "
-                                "remaining scenarios for this flavor will be skipped.",
+                                "WARNING: final scenario cleanup failed "
+                                f"for flavor={flavor} scenario={scenario_name} "
+                                f"(rc={cleanup_exc.returncode}).",
                                 flush=True,
                             )
             else:
@@ -1456,3 +1242,4 @@ if __name__ == "__main__":
         main()
     except subprocess.CalledProcessError as exc:
         raise SystemExit(exc.returncode) from exc
+

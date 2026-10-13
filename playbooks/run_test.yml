@@ -264,16 +264,15 @@
         - connection-capacity-preflight.csv
         - connection-errors-preflight.csv
       when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
-    - name: Store preflight result for subsequent plays
-      ansible.builtin.set_fact:
-        capacity_preflight_failed: "{{ (capacity_preflight.rc | default(0) | int) != 0 }}"
+    - name: Publish preflight status on runtime target
+      ansible.builtin.add_host:
+        name: runtime_target
+        target_state: "{{ target }}"
+        capacity_preflight_rc: "{{ capacity_preflight.rc | default(1) | int }}"
+        capacity_preflight_failed: "{{ (capacity_preflight.rc | default(1) | int) != 0 }}"
+      run_once: true
       when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
-    - name: Report preflight failure without skipping cleanup
-      ansible.builtin.debug:
-        msg: "Capacity preflight failed (rc={{ capacity_preflight.rc }}); skipping capacity workers, retaining diagnostics for collection."
-      when:
-        - (target.benchmark_engine | default('locust')) == 'connection_capacity'
-        - capacity_preflight_failed | default(false) | bool
+
 
 - name: Prepare synchronized connection-capacity start
   hosts: localhost
@@ -285,6 +284,8 @@
       ansible.builtin.add_host:
         name: runtime_target
         target_state: "{{ target }}"
+        capacity_preflight_rc: "{{ hostvars['runtime_target'].capacity_preflight_rc | default(0) }}"
+        capacity_preflight_failed: "{{ hostvars['runtime_target'].capacity_preflight_failed | default(false) }}"
         connection_start_epoch: >-
           {{ (lookup('pipe', 'date +%s') | int) + ((connection_capacity | default({})).sync_start_delay_seconds | default(8) | int) }}
       when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
@@ -363,7 +364,7 @@
       changed_when: true
       when:
         - (target.benchmark_engine | default('locust')) == 'connection_capacity'
-        - not (hostvars[groups['locust_workers'][0]].capacity_preflight_failed | default(false) | bool)
+        - not (hostvars['runtime_target'].capacity_preflight_failed | default(false) | bool)
     - name: Persist capacity runner status
       ansible.builtin.copy:
         content: "{{ capacity_run.rc | default('skipped') }}\n"
@@ -372,23 +373,49 @@
       become: true
       when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
 
-    - name: Fetch capacity worker diagnostics
+    - name: Discover capacity worker result artifacts
+      ansible.builtin.find:
+        paths: "{{ remote_result_dir }}"
+        patterns:
+          - "connection-capacity-*.csv"
+          - "connection-errors-*.csv"
+          - "connection-capacity-*.log"
+          - "connection-capacity-*.exitcode"
+          - "capacity-runner.exitcode"
+        file_type: file
+        recurse: false
+      register: capacity_artifacts
+      become: true
+      when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
+
+    - name: Fetch capacity worker result artifacts
       ansible.builtin.fetch:
-        src: "{{ remote_result_dir }}/{{ item.0 }}{{ item.1 }}"
-        dest: "{{ playbook_dir }}/../results/{{ target.benchmark_id }}/raw/{{ inventory_hostname }}/{{ item.0 }}{{ item.1 }}"
+        src: "{{ item.path }}"
+        dest: "{{ playbook_dir }}/../results/{{ target.benchmark_id }}/raw/{{ inventory_hostname }}/{{ item.path | basename }}"
         flat: true
         fail_on_missing: false
       become: true
-      loop: "{{ ['connection-capacity-p00', 'connection-capacity-p01', 'connection-capacity-p02', 'connection-capacity-p03'] | product(['.log', '.exitcode']) | list }}"
+      loop: "{{ capacity_artifacts.files | default([]) }}"
       when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
-    - name: Fetch capacity runner exit status
-      ansible.builtin.fetch:
-        src: "{{ remote_result_dir }}/capacity-runner.exitcode"
-        dest: "{{ playbook_dir }}/../results/{{ target.benchmark_id }}/raw/{{ inventory_hostname }}/capacity-runner.exitcode"
-        flat: true
-        fail_on_missing: false
-      become: true
+
+    - name: Publish capacity worker status for post-cleanup validation
+      ansible.builtin.set_fact:
+        capacity_worker_rc: "{{ capacity_run.rc | default(1) | int }}"
       when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
+
+    - name: Count capacity CSVs produced by this generator
+      ansible.builtin.set_fact:
+        capacity_csv_count: >-
+          {{
+            capacity_artifacts.files
+            | default([])
+            | map(attribute='path')
+            | select('match', '.*/connection-capacity-p[0-9]+\.csv$')
+            | list
+            | length
+          }}
+      when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
+
 
 - name: Stop samplers and workers
   hosts: benchmark_nodes
@@ -433,3 +460,35 @@
       changed_when: true
       failed_when: false
       when: (target.traffic_path | default('tenant_vip')) == 'floating_ip'
+
+- name: Validate collected connection-capacity results after cleanup
+  hosts: localhost
+  gather_facts: false
+  vars:
+    target: "{{ hostvars['runtime_target'].target_state }}"
+    local_raw_dir: "{{ playbook_dir }}/../results/{{ target.benchmark_id }}/raw"
+    expected_processes: "{{ connection_capacity.processes_per_vm | default(2) | int }}"
+  tasks:
+    - name: Find collected worker capacity CSV files
+      ansible.builtin.find:
+        paths: "{{ local_raw_dir }}"
+        patterns: "connection-capacity-p*.csv"
+        recurse: true
+        file_type: file
+      register: collected_capacity_csvs
+      when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
+
+    - name: Require successful preflight and complete distributed measurements
+      ansible.builtin.assert:
+        that:
+          - not (hostvars['runtime_target'].capacity_preflight_failed | default(true) | bool)
+          - >-
+            (groups['locust_workers'] | map('extract', hostvars, 'capacity_worker_rc') | map('int') | select('ne', 0) | list | length) == 0
+          - (collected_capacity_csvs.matched | default(0) | int) == ((groups['locust_workers'] | length) * (expected_processes | int))
+        fail_msg: >-
+          Capacity run is incomplete: preflight_failed={{ hostvars['runtime_target'].capacity_preflight_failed | default('unknown') }},
+          expected_worker_csvs={{ (groups['locust_workers'] | length) * (expected_processes | int) }},
+          collected_worker_csvs={{ collected_capacity_csvs.matched | default(0) }}.
+          Review the per-run orchestration/run_test.log and raw/*/preflight.log or connection-capacity-p*.log.
+      when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
+
