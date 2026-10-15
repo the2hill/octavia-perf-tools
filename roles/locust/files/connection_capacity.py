@@ -210,19 +210,40 @@ class CapacityRunner:
             errors.update(heartbeat_errors)
         return survivors, errors
 
-    def close_all(self, connections: list[HeldConnection]) -> None:
+    @staticmethod
+    async def _wait_writer_closed(writer: asyncio.StreamWriter) -> None:
+        try:
+            await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+        except Exception:  # A timed-out or reset connection is already unusable.
+            pass
+
+    async def close_all(self, connections: list[HeldConnection]) -> None:
         linger = struct.pack("ii", 1, 0)
+
+        # Initiate closure for every connection first.
         for conn in connections:
             try:
                 raw_sock = conn.writer.get_extra_info("socket")
                 if self.args.abortive_close and raw_sock is not None:
-                    raw_sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, linger)
+                    raw_sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                        linger)
             except OSError:
                 pass
+
             try:
                 conn.writer.close()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
+
+        # Wait for closure in bounded batches to avoid creating tens of
+        # thousands of additional waiting coroutines at once.
+        batch_size = 1024
+        for offset in range(0, len(connections), batch_size):
+            batch = connections[offset: offset + batch_size]
+            await asyncio.gather(
+                *(self._wait_writer_closed(conn.writer) for conn in batch),
+                return_exceptions=True,
+            )
 
     async def run(self) -> None:
         levels = self.args.levels
@@ -315,8 +336,17 @@ class CapacityRunner:
                 latency_file.flush()
                 errors_file.flush()
 
-                self.close_all(connections)
-                if level_index + 1 < len(levels) and self.args.inter_level_cooldown_seconds > 0:
+                await self.close_all(connections)
+
+                # Release prior-level objects before allocating the next
+                # level's connections.
+                connections.clear()
+                survivors.clear()
+                latencies.clear()
+                await asyncio.sleep(0)
+
+                if level_index + 1 < len(
+                        levels) and self.args.inter_level_cooldown_seconds > 0:
                     await asyncio.sleep(self.args.inter_level_cooldown_seconds)
 
 

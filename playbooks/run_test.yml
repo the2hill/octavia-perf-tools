@@ -226,11 +226,19 @@
             --start-epoch {{ hostvars['runtime_target'].connection_start_epoch | quote }}
             --output-dir {{ remote_result_dir | quote }}
             --output-prefix "$prefix"
+          {% if tls.client_insecure | default(true) | bool %}
+            --insecure
+          {% endif %}
+          {% if connection_capacity.abortive_close | default(true) | bool %}
+            --abortive-close
+          {% endif %}
+          {% if connection_capacity.verify_idle_at_end | default(true) | bool %}
+            --verify-idle-at-end
+          {% endif %}
+          {% if connection_capacity.tcp_nodelay | default(true) | bool %}
+            --tcp-nodelay
+          {% endif %}
           )
-          {% if tls.client_insecure | default(true) | bool %}cmd+=(--insecure){% endif %}
-          {% if connection_capacity.abortive_close | default(true) | bool %}cmd+=(--abortive-close){% endif %}
-          {% if connection_capacity.verify_idle_at_end | default(true) | bool %}cmd+=(--verify-idle-at-end){% endif %}
-          {% if connection_capacity.tcp_nodelay | default(true) | bool %}cmd+=(--tcp-nodelay){% endif %}
           printf 'capacity worker command:'
           printf ' %q' "${cmd[@]}"
           printf '\n'
