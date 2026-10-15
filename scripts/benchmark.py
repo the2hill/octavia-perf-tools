@@ -23,28 +23,19 @@ PYTHON = ROOT / ".venv" / "bin" / "python"
 def run(*args: str, log_path: pathlib.Path | None = None) -> None:
     print("+", " ".join(args), flush=True)
     if log_path is None:
-        subprocess.run(args, cwd=ROOT, check=True)
-        return
-
+        log_path = ROOT / "results" / "_last_command.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8") as log:
-        proc = subprocess.Popen(
-            args,
-            cwd=ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
+        proc = subprocess.Popen(args,cwd=ROOT,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
         assert proc.stdout is not None
+        out=[]
         for line in proc.stdout:
-            print(line, end="", flush=True)
-            log.write(line)
-            log.flush()
-        returncode = proc.wait()
-    if returncode:
-        raise subprocess.CalledProcessError(returncode, args)
-
+            print(line,end="",flush=True); log.write(line); out.append(line)
+        rc=proc.wait()
+    if rc:
+        e=subprocess.CalledProcessError(rc,args)
+        e.output="".join(out)
+        raise e
 
 def slug(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-") or "default"
@@ -75,8 +66,8 @@ def write_run_failure(
         .isoformat(),
         "stage": stage,
         "returncode": exc.returncode,
-        "run_test_log": str(result_dir / "orchestration" / "run_test.log") if stage == "run_test" else None,
         "command": [str(x) for x in (exc.cmd if isinstance(exc.cmd, (list, tuple)) else [exc.cmd])],
+        "output_tail": (getattr(exc,"output","") or "").splitlines()[-100:],
     }
     (result_dir / "RUN_FAILED.yml").write_text(
         yaml.safe_dump(failure, sort_keys=False), encoding="utf-8"
@@ -86,7 +77,7 @@ def write_run_failure(
 def generate_report_best_effort(result_dir: pathlib.Path) -> bool:
     """Generate reporting artifacts without reclassifying a completed load test as failed."""
     try:
-        run(str(PYTHON), "scripts/report.py", str(result_dir), log_path=result_dir / "orchestration" / "report.log")
+        run(str(PYTHON), "scripts/report.py", str(result_dir))
         return True
     except subprocess.CalledProcessError as exc:
         failure = {
@@ -95,7 +86,6 @@ def generate_report_best_effort(result_dir: pathlib.Path) -> bool:
             .isoformat(),
             "stage": "report",
             "returncode": exc.returncode,
-            "report_log": str(result_dir / "orchestration" / "report.log"),
             "command": [
                 str(x)
                 for x in (
@@ -317,22 +307,13 @@ def one_run(
         }
         (result_dir / "timing.yml").write_text(yaml.safe_dump(timing, sort_keys=False))
         stage = "collect"
-        ansible("playbooks/collect.yml", config, **common)
+        ansible("playbooks/collect.yml", config, log_path=result_dir / "orchestration" / "collect.log", **common)
         stage = "manifest"
         run(str(PYTHON), "scripts/manifest.py", str(result_dir))
         stage = "report"
         generate_report_best_effort(result_dir)
         stage = "complete"
     except subprocess.CalledProcessError as exc:
-        if stage == "run_test":
-            try:
-                ansible(
-                    "playbooks/collect.yml", config,
-                    log_path=result_dir / "orchestration" / "collect-after-failure.log",
-                    **common,
-                )
-            except subprocess.CalledProcessError as collect_exc:
-                print(f"WARNING: collection after run_test failure returned rc={collect_exc.returncode}", flush=True)
         write_run_failure(result_dir, stage=stage, exc=exc)
         if target_kind == "octavia" and reuse_campaign_lb and campaign_id is not None:
             try:
@@ -438,22 +419,13 @@ def run_preconfigured_campaign_rep(
         )
 
         stage = "collect"
-        ansible("playbooks/collect.yml", config, **common)
+        ansible("playbooks/collect.yml", config, log_path=result_dir / "orchestration" / "collect.log", **common)
         stage = "manifest"
         run(str(PYTHON), "scripts/manifest.py", str(result_dir))
         stage = "report"
         generate_report_best_effort(result_dir)
         stage = "complete"
     except subprocess.CalledProcessError as exc:
-        if stage == "run_test":
-            try:
-                ansible(
-                    "playbooks/collect.yml", config,
-                    log_path=result_dir / "orchestration" / "collect-after-failure.log",
-                    **common,
-                )
-            except subprocess.CalledProcessError as collect_exc:
-                print(f"WARNING: collection after run_test failure returned rc={collect_exc.returncode}", flush=True)
         write_run_failure(result_dir, stage=stage, exc=exc)
         try:
             collect_lb_failure_diagnostics(
