@@ -371,6 +371,23 @@ def aggregate_octavia(selected: pd.DataFrame) -> pd.DataFrame:
         primary = finite_numeric(group["primary_value"])
         p99 = finite_numeric(group["p99_effective_ms"])
         failure = finite_numeric(group["failure_percent_effective"])
+        peak_established = finite_numeric(
+            group.get("peak_established_connections", pd.Series(index=group.index, dtype=float))
+        )
+        max_tested_connections = finite_numeric(
+            group.get("max_tested_connections", pd.Series(index=group.index, dtype=float))
+        )
+        first_failing_target = finite_numeric(
+            group.get("first_failing_connection_target", pd.Series(index=group.index, dtype=float))
+        )
+        ceiling_pairs = pd.DataFrame(
+            {"tested": group.get("max_tested_connections", pd.Series(index=group.index, dtype=float)),
+             "ceiling": group.get("generator_safe_connection_ceiling", pd.Series(index=group.index, dtype=float))}
+        ).apply(pd.to_numeric, errors="coerce").dropna()
+        ceiling_attempted_percent = (
+            float((ceiling_pairs["tested"] >= ceiling_pairs["ceiling"]).mean() * 100.0)
+            if not ceiling_pairs.empty else math.nan
+        )
         requests = finite_numeric(group.get("requests", pd.Series(index=group.index, dtype=float)))
         failures = finite_numeric(group.get("failures", pd.Series(index=group.index, dtype=float)))
         amphora_peak_cpu_cores = finite_numeric(group.get("amphora_peak_cpu_cores", pd.Series(index=group.index, dtype=float)))
@@ -403,6 +420,13 @@ def aggregate_octavia(selected: pd.DataFrame) -> pd.DataFrame:
                 "min_p99_ms": p99.min(),
                 "max_p99_ms": p99.max(),
                 "median_failure_percent": failure.median(),
+                # Capacity diagnostics are populated for connection-capacity runs;
+                # non-capacity runs naturally retain NaN values for these columns.
+                "median_peak_established_connections": peak_established.median(),
+                "max_peak_established_connections": peak_established.max(),
+                "median_max_tested_connections": max_tested_connections.median(),
+                "median_first_failing_connection_target": first_failing_target.median(),
+                "ceiling_attempted_percent": ceiling_attempted_percent,
                 "median_amphora_peak_cpu_cores": amphora_peak_cpu_cores.median(),
                 "median_amphora_peak_cpu_percent": amphora_peak_cpu_percent.median(),
                 "median_amphora_hottest_vcpu_percent": amphora_hottest_vcpu_percent.median(),
@@ -785,6 +809,16 @@ See [`DETAILED_COMPARISON.md`](DETAILED_COMPARISON.md) for actual metric values,
                 "Fingerprints": group["population_fingerprint_count"].astype(int).astype(str),
             }
         )
+        if metric == "max_sustainable_connections":
+            # Keep sustainable capacity as the primary metric, but expose the
+            # observed peak and test boundary so a ceiling result is not confused
+            # with the highest sustainable level.
+            display["Peak established"] = group["median_peak_established_connections"].map(fmt)
+            display["Max tested"] = group["median_max_tested_connections"].map(fmt)
+            display["First failing target"] = group["median_first_failing_connection_target"].map(fmt)
+            display["Ceiling attempted"] = group["ceiling_attempted_percent"].map(
+                lambda x: "—" if pd.isna(x) else f"{x:.0f}% of runs"
+            )
         if reference_flavor:
             display.insert(7, f"vs {reference_flavor}", group["delta_vs_reference_percent"].map(fmt_pct))
         if group["median_amphora_peak_cpu_cores"].notna().any():
