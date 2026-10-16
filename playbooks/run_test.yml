@@ -15,7 +15,6 @@
       ansible.builtin.add_host:
         name: runtime_target
         target_state: "{{ target_state }}"
-
 - name: Constrain FIP benchmark routes to the external-network MTU
   hosts: master:locust_workers
   gather_facts: false
@@ -37,7 +36,6 @@
       become: true
       changed_when: true
       when: (target.traffic_path | default('tenant_vip')) == 'floating_ip'
-
 - name: Verify target before benchmark
   hosts: master
   gather_facts: false
@@ -54,7 +52,6 @@
       retries: 12
       delay: 2
       until: target_ready.status | default(0) == 200
-
 - name: Start metrics sampling everywhere
   hosts: benchmark_nodes
   gather_facts: false
@@ -79,7 +76,6 @@
         >/dev/null 2>&1 &
       changed_when: true
       become: true
-
 - name: Start distributed Locust workers
   hosts: locust_workers
   gather_facts: false
@@ -113,7 +109,6 @@
       changed_when: true
       become: true
       when: (target.benchmark_engine | default('locust')) == 'locust'
-
 - name: Run Locust master headlessly
   hosts: master
   gather_facts: false
@@ -160,11 +155,9 @@
       when:
         - (target.benchmark_engine | default('locust')) == 'locust'
         - locust_master_run is defined
-
 # Connection-capacity execution is validated from actual distributed worker output.
 # Do not run a separate single-connection preflight: it can reject a valid
 # capacity test before any measurable worker results are generated.
-
 - name: Prepare synchronized connection-capacity start
   hosts: localhost
   gather_facts: false
@@ -178,7 +171,70 @@
         connection_start_epoch: >-
           {{ (lookup('pipe', 'date +%s') | int) + ((connection_capacity | default({})).sync_start_delay_seconds | default(8) | int) }}
       when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
-
+- name: Start connection-capacity level coordinator
+  hosts: master
+  gather_facts: false
+  vars:
+    target: "{{ hostvars['runtime_target'].target_state }}"
+    remote_result_dir: "/var/lib/octavia-perf/results/{{ target.benchmark_id }}"
+    capacity_coordinator_port: "{{ connection_capacity.coordinator_port | default(5557) | int }}"
+    capacity_coordinator_timeout: "{{ connection_capacity.barrier_timeout_seconds | default(900) | int }}"
+    capacity_total_processes: "{{ (vm.locust.worker_vms | int) * (connection_capacity.processes_per_vm | default(2) | int) }}"
+  tasks:
+    - name: Install capacity level coordinator
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../roles/locust/files/capacity_coordinator.py"
+        dest: /opt/octavia-perf/capacity_coordinator.py
+        owner: root
+        group: root
+        mode: "0755"
+      become: true
+      when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
+    - name: Stop stale capacity coordinator
+      ansible.builtin.shell: |
+        set -euo pipefail
+        if pgrep -af '[c]apacity_coordinator.py' >/dev/null; then
+          pkill -f '[c]apacity_coordinator.py' || true
+          sleep 1
+        fi
+      args:
+        executable: /bin/bash
+      become: true
+      changed_when: false
+      when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
+    - name: Wait for stale coordinator listener to stop
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ capacity_coordinator_port | int }}"
+        timeout: 10
+        state: stopped
+      become: true
+      when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
+    - name: Start capacity level coordinator
+      ansible.builtin.shell: |
+        set -euo pipefail
+        nohup /opt/octavia-perf/capacity_coordinator.py \
+          --bind 0.0.0.0 \
+          --port {{ capacity_coordinator_port }} \
+          --run-id {{ target.benchmark_id | quote }} \
+          --worker-count {{ capacity_total_processes }} \
+          --barrier-timeout-seconds {{ capacity_coordinator_timeout }} \
+          --ready-file {{ (remote_result_dir + '/capacity-coordinator.ready') | quote }} \
+          >{{ (remote_result_dir + '/capacity-coordinator.log') | quote }} 2>&1 &
+        echo $! >/var/run/octavia-perf-capacity-coordinator.pid
+      args:
+        executable: /bin/bash
+      become: true
+      changed_when: true
+      when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
+    - name: Wait for capacity coordinator listener
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ capacity_coordinator_port | int }}"
+        timeout: 15
+        state: started
+      become: true
+      when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
 - name: Run distributed concurrent-connection capacity workers
   hosts: locust_workers
   gather_facts: false
@@ -190,7 +246,19 @@
     capacity_processes_per_vm: "{{ connection_capacity.processes_per_vm | default(2) | int }}"
     capacity_total_processes: "{{ (vm.locust.worker_vms | int) * (connection_capacity.processes_per_vm | default(2) | int) }}"
     capacity_vm_index: "{{ groups['locust_workers'].index(inventory_hostname) }}"
+    capacity_coordinator_host: "{{ hostvars[groups['master'][0]].private_ip }}"
+    capacity_coordinator_port: "{{ connection_capacity.coordinator_port | default(5557) | int }}"
+    capacity_coordinator_timeout: "{{ connection_capacity.barrier_timeout_seconds | default(900) | int }}"
   tasks:
+    - name: Install connection-capacity runner
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../roles/locust/files/connection_capacity.py"
+        dest: /opt/octavia-perf/connection_capacity.py
+        owner: root
+        group: root
+        mode: "0755"
+      become: true
+      when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
     - name: Run capacity worker processes
       ansible.builtin.shell: |
         set -euo pipefail
@@ -226,19 +294,24 @@
             --start-epoch {{ hostvars['runtime_target'].connection_start_epoch | quote }}
             --output-dir {{ remote_result_dir | quote }}
             --output-prefix "$prefix"
+            --coordinator-host {{ capacity_coordinator_host | quote }}
+            --coordinator-port {{ capacity_coordinator_port | quote }}
+            --coordinator-run-id {{ target.benchmark_id | quote }}
+            --barrier-timeout-seconds {{ capacity_coordinator_timeout | quote }}
+            --require-coordinator
+          )
           {% if tls.client_insecure | default(true) | bool %}
-            --insecure
+          cmd+=(--insecure)
           {% endif %}
           {% if connection_capacity.abortive_close | default(true) | bool %}
-            --abortive-close
+          cmd+=(--abortive-close)
           {% endif %}
           {% if connection_capacity.verify_idle_at_end | default(true) | bool %}
-            --verify-idle-at-end
+          cmd+=(--verify-idle-at-end)
           {% endif %}
           {% if connection_capacity.tcp_nodelay | default(true) | bool %}
-            --tcp-nodelay
+          cmd+=(--tcp-nodelay)
           {% endif %}
-          )
           printf 'capacity worker command:'
           printf ' %q' "${cmd[@]}"
           printf '\n'
@@ -268,7 +341,6 @@
         mode: '0644'
       become: true
       when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
-
     - name: Discover capacity worker result artifacts
       ansible.builtin.find:
         paths: "{{ remote_result_dir }}"
@@ -283,7 +355,6 @@
       register: capacity_artifacts
       become: true
       when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
-
     - name: Fetch capacity worker result artifacts
       ansible.builtin.fetch:
         src: "{{ item.path }}"
@@ -293,12 +364,10 @@
       become: true
       loop: "{{ capacity_artifacts.files | default([]) }}"
       when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
-
     - name: Publish capacity worker status for post-cleanup validation
       ansible.builtin.set_fact:
         capacity_worker_rc: "{{ capacity_run.rc | default(1) | int }}"
       when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
-
     - name: Count capacity CSVs produced by this generator
       ansible.builtin.set_fact:
         capacity_csv_count: >-
@@ -311,13 +380,12 @@
             | length
           }}
       when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
-
-
 - name: Stop samplers and workers
   hosts: benchmark_nodes
   gather_facts: false
   vars:
     target: "{{ hostvars['runtime_target'].target_state }}"
+    remote_result_dir: "/var/lib/octavia-perf/results/{{ hostvars['runtime_target'].target_state.benchmark_id }}"
   tasks:
     - name: Stop metrics sampler
       ansible.builtin.shell: "pkill -f '[m]etrics_sampler.py' || true"
@@ -337,7 +405,34 @@
       when:
         - inventory_hostname in groups['locust_workers']
         - (target.benchmark_engine | default('locust')) == 'connection_capacity'
-
+    - name: Collect capacity coordinator log before stopping coordinator
+      ansible.builtin.fetch:
+        src: "{{ remote_result_dir }}/capacity-coordinator.log"
+        dest: "{{ playbook_dir }}/../results/{{ target.benchmark_id }}/raw/master/capacity-coordinator.log"
+        flat: true
+        fail_on_missing: false
+      become: true
+      when:
+        - inventory_hostname in groups['master']
+        - (target.benchmark_engine | default('locust')) == 'connection_capacity'
+    - name: Stop capacity level coordinator
+      ansible.builtin.shell: |
+        set -euo pipefail
+        pid_file=/var/run/octavia-perf-capacity-coordinator.pid
+        if [ -s "$pid_file" ]; then
+          pid=$(cat "$pid_file")
+          if [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' <"/proc/$pid/cmdline" | grep -Fq /opt/octavia-perf/capacity_coordinator.py; then
+            kill "$pid" 2>/dev/null || true
+          fi
+          rm -f "$pid_file"
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: false
+      become: true
+      when:
+        - inventory_hostname in groups['master']
+        - (target.benchmark_engine | default('locust')) == 'connection_capacity'
 - name: Restore temporary FIP benchmark routes
   hosts: master:locust_workers
   gather_facts: false
@@ -356,7 +451,6 @@
       changed_when: true
       failed_when: false
       when: (target.traffic_path | default('tenant_vip')) == 'floating_ip'
-
 - name: Validate collected connection-capacity results after cleanup
   hosts: localhost
   gather_facts: false
@@ -373,7 +467,6 @@
         file_type: file
       register: collected_capacity_csvs
       when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
-
     - name: Require complete distributed connection-capacity measurements
       ansible.builtin.assert:
         that:
@@ -385,7 +478,6 @@
           collected_worker_csvs={{ collected_capacity_csvs.matched | default(0) }}.
           Review orchestration/run_test.log and raw/*/connection-capacity-p*.log and .exitcode files.
       when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
-
     - name: Verify at least one capacity connection was established
       ansible.builtin.shell: |
         {{ ansible_playbook_python | quote }} - {{ local_raw_dir | quote }} <<'PY'
@@ -413,4 +505,3 @@
       when:
         - (target.benchmark_engine | default('locust')) == 'connection_capacity'
         - (collected_capacity_csvs.matched | default(0) | int) == ((groups['locust_workers'] | length) * (expected_processes | int))
-

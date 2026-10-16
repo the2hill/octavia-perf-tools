@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
+"""Distributed asyncio connection-capacity runner for Octavia benchmarks.
+
+Connections are kept active while a worker opens its share of each target. When a
+coordinator is configured, workers synchronize at every target so a level is only
+reported after the complete worker set has reached the checkpoint.
+"""
 from __future__ import annotations
 
 import argparse
 import asyncio
 import csv
+import json
 import math
 import os
 import socket
@@ -75,18 +82,16 @@ class CapacityRunner:
                 conn = HeldConnection(reader=reader, writer=writer)
                 if self.args.capacity_mode == "active":
                     await self.http_exchange(conn)
-                latency_ms = (time.perf_counter() - started) * 1000.0
-                return conn, latency_ms, None
-        except Exception as exc:  # noqa: BLE001 - benchmark must classify all failures
-            latency_ms = (time.perf_counter() - started) * 1000.0
-            return None, latency_ms, self.error_key(exc)
+                return conn, (time.perf_counter() - started) * 1000.0, None
+        except Exception as exc:  # benchmark must classify individual connection failures
+            return None, (time.perf_counter() - started) * 1000.0, self.error_key(exc)
 
     async def http_exchange(self, conn: HeldConnection) -> None:
         async with self.io_sem:
             request = (
                 f"GET {self.args.path} HTTP/1.1\r\n"
                 f"Host: {self.host_header}\r\n"
-                "User-Agent: octavia-perf-connection-capacity/1\r\n"
+                "User-Agent: octavia-perf-connection-capacity/2\r\n"
                 "Accept: */*\r\n"
                 "Connection: keep-alive\r\n\r\n"
             ).encode("ascii")
@@ -112,7 +117,9 @@ class CapacityRunner:
             if "content-length" in headers:
                 length = int(headers["content-length"])
                 if length:
-                    await asyncio.wait_for(conn.reader.readexactly(length), timeout=self.args.request_timeout)
+                    await asyncio.wait_for(
+                        conn.reader.readexactly(length), timeout=self.args.request_timeout
+                    )
             elif headers.get("transfer-encoding") == "chunked":
                 await self.read_chunked(conn.reader)
             else:
@@ -129,7 +136,7 @@ class CapacityRunner:
 
     @staticmethod
     def error_key(exc: Exception) -> str:
-        if isinstance(exc, asyncio.TimeoutError):
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
             return "timeout"
         if isinstance(exc, ssl.SSLError):
             return f"ssl:{exc.__class__.__name__}"
@@ -139,24 +146,25 @@ class CapacityRunner:
         text = str(exc).strip().replace(",", ";")[:100]
         return f"{exc.__class__.__name__}:{text}" if text else exc.__class__.__name__
 
-    async def open_level(self, target: int) -> tuple[list[HeldConnection], list[float], Counter[str], float]:
+    async def open_level(
+        self, target: int, connections: list[HeldConnection]
+    ) -> tuple[list[float], Counter[str], float]:
+        """Open this worker's share while the active heartbeat task services live sockets."""
         if target <= 0:
-            return [], [], Counter(), 0.0
+            return [], Counter(), 0.0
         started = time.perf_counter()
-        connections: list[HeldConnection] = []
         latencies: list[float] = []
         errors: Counter[str] = Counter()
         ramp = max(0.001, float(self.args.ramp_seconds))
         pacing_slices = max(1, int(ramp * 10))
         batch_size = max(1, min(self.args.open_concurrency, math.ceil(target / pacing_slices)))
         attempted = 0
-
         while attempted < target:
             batch_n = min(batch_size, target - attempted)
             desired_elapsed = (attempted / target) * ramp
-            now_elapsed = time.perf_counter() - started
-            if desired_elapsed > now_elapsed:
-                await asyncio.sleep(desired_elapsed - now_elapsed)
+            elapsed = time.perf_counter() - started
+            if desired_elapsed > elapsed:
+                await asyncio.sleep(desired_elapsed - elapsed)
             results = await asyncio.gather(*(self.open_one() for _ in range(batch_n)))
             attempted += batch_n
             for conn, latency_ms, error in results:
@@ -165,22 +173,25 @@ class CapacityRunner:
                     latencies.append(latency_ms)
                 else:
                     errors[error or "unknown"] += 1
+        return latencies, errors, time.perf_counter() - started
 
-        return connections, latencies, errors, time.perf_counter() - started
-
-    async def verify_connections(self, connections: list[HeldConnection]) -> tuple[list[HeldConnection], Counter[str]]:
+    async def verify_connections(
+        self, connections: list[HeldConnection]
+    ) -> tuple[list[HeldConnection], Counter[str]]:
         async def check(conn: HeldConnection) -> tuple[HeldConnection | None, str | None]:
             try:
                 await self.http_exchange(conn)
                 return conn, None
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:  # benchmark must classify individual connection failures
                 return None, self.error_key(exc)
 
         survivors: list[HeldConnection] = []
         errors: Counter[str] = Counter()
-        chunk = max(1, self.args.io_concurrency * 2)
-        for offset in range(0, len(connections), chunk):
-            results = await asyncio.gather(*(check(c) for c in connections[offset : offset + chunk]))
+        chunk_size = max(1, self.args.io_concurrency * 2)
+        for offset in range(0, len(connections), chunk_size):
+            results = await asyncio.gather(
+                *(check(conn) for conn in connections[offset:offset + chunk_size])
+            )
             for conn, error in results:
                 if conn is not None:
                     survivors.append(conn)
@@ -188,60 +199,118 @@ class CapacityRunner:
                     errors[error or "unknown"] += 1
         return survivors, errors
 
-    async def hold_level(self, connections: list[HeldConnection]) -> tuple[list[HeldConnection], Counter[str]]:
-        errors: Counter[str] = Counter()
-        if not connections:
-            return connections, errors
-        if self.args.capacity_mode == "idle":
-            await asyncio.sleep(self.args.hold_seconds)
-            if self.args.verify_idle_at_end:
-                return await self.verify_connections(connections)
-            return connections, errors
+    async def maintain_connections(
+        self,
+        connections: list[HeldConnection],
+        stop_event: asyncio.Event,
+        errors: Counter[str],
+    ) -> None:
+        """Send active requests periodically during ramp, barriers, and hold."""
+        interval = max(0.1, float(self.args.heartbeat_seconds))
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                return
+            except asyncio.TimeoutError:
+                pass
+            snapshot = list(connections)
+            if not snapshot:
+                continue
+            survivors, found_errors = await self.verify_connections(snapshot)
+            errors.update(found_errors)
+            survivor_ids = {id(conn) for conn in survivors}
+            snapshot_ids = {id(conn) for conn in snapshot}
+            for conn in snapshot:
+                if id(conn) not in survivor_ids:
+                    try:
+                        conn.writer.close()
+                    except Exception:
+                        pass
+            # Preserve sockets appended during this verification pass.
+            connections[:] = [
+                conn for conn in connections
+                if id(conn) not in snapshot_ids or id(conn) in survivor_ids
+            ]
 
-        deadline = time.monotonic() + self.args.hold_seconds
-        survivors = connections
-        while survivors and time.monotonic() < deadline:
-            sleep_for = min(self.args.heartbeat_seconds, max(0.0, deadline - time.monotonic()))
-            if sleep_for:
-                await asyncio.sleep(sleep_for)
-            if time.monotonic() >= deadline and self.args.skip_final_heartbeat:
-                break
-            survivors, heartbeat_errors = await self.verify_connections(survivors)
-            errors.update(heartbeat_errors)
-        return survivors, errors
+    async def wait_for_coordinator(self, level: int, phase: str) -> None:
+        """Wait for all distributed workers at this target/phase."""
+        if not self.args.coordinator_host:
+            if self.args.require_coordinator:
+                raise RuntimeError("coordinator is required but --coordinator-host is unset")
+            return
+        writer: asyncio.StreamWriter | None = None
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(self.args.coordinator_host, self.args.coordinator_port),
+                timeout=self.args.connect_timeout,
+            )
+            request = {
+                "run_id": self.args.coordinator_run_id,
+                "worker_index": self.args.worker_index,
+                "level": level,
+                "phase": phase,
+            }
+            writer.write(json.dumps(request, separators=(",", ":")).encode("utf-8") + b"\n")
+            await writer.drain()
+            raw = await asyncio.wait_for(
+                reader.readline(), timeout=self.args.barrier_timeout_seconds + 10.0
+            )
+            if not raw:
+                raise RuntimeError(f"coordinator closed connection at level {level}")
+            response = json.loads(raw.decode("utf-8"))
+            if (
+                response.get("status") != "go"
+                or int(response.get("level", -1)) != level
+                or response.get("phase") != phase
+            ):
+                raise RuntimeError(
+                    f"coordinator rejected phase={phase} level={level}: {response!r}"
+                )
+            print(
+                f"worker={self.args.worker_index}/{self.args.worker_count} "
+                f"global barrier released phase={phase} level={level}", flush=True,
+            )
+        finally:
+            if writer is not None:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+    async def hold_idle_level(
+        self, connections: list[HeldConnection]
+    ) -> tuple[list[HeldConnection], Counter[str]]:
+        # Do not generate traffic during an idle hold; verify only when hold ends.
+        await asyncio.sleep(self.args.hold_seconds)
+        if self.args.verify_idle_at_end:
+            return await self.verify_connections(connections)
+        return list(connections), Counter()
 
     @staticmethod
-    async def _wait_writer_closed(writer: asyncio.StreamWriter) -> None:
+    async def wait_writer_closed(writer: asyncio.StreamWriter) -> None:
         try:
             await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
-        except Exception:  # A timed-out or reset connection is already unusable.
+        except Exception:
             pass
 
     async def close_all(self, connections: list[HeldConnection]) -> None:
         linger = struct.pack("ii", 1, 0)
-
-        # Initiate closure for every connection first.
         for conn in connections:
             try:
                 raw_sock = conn.writer.get_extra_info("socket")
                 if self.args.abortive_close and raw_sock is not None:
-                    raw_sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
-                                        linger)
+                    raw_sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, linger)
             except OSError:
                 pass
-
             try:
                 conn.writer.close()
             except Exception:
                 pass
-
-        # Wait for closure in bounded batches to avoid creating tens of
-        # thousands of additional waiting coroutines at once.
         batch_size = 1024
         for offset in range(0, len(connections), batch_size):
-            batch = connections[offset: offset + batch_size]
             await asyncio.gather(
-                *(self._wait_writer_closed(conn.writer) for conn in batch),
+                *(self.wait_writer_closed(conn.writer) for conn in connections[offset:offset + batch_size]),
                 return_exceptions=True,
             )
 
@@ -250,26 +319,17 @@ class CapacityRunner:
         start_wait = self.args.start_epoch - time.time()
         if start_wait > 0:
             await asyncio.sleep(start_wait)
-
         with self.summary_path.open("w", newline="") as summary_file, self.latency_path.open(
             "w", newline=""
         ) as latency_file, self.errors_path.open("w", newline="") as errors_file:
             summary_writer = csv.DictWriter(
                 summary_file,
                 fieldnames=[
-                    "worker_index",
-                    "worker_count",
-                    "capacity_mode",
-                    "target_global",
-                    "target_worker",
-                    "attempted",
-                    "established",
-                    "establish_failed",
-                    "surviving",
-                    "survival_failed",
-                    "ramp_elapsed_seconds",
-                    "established_per_second",
-                    "level_elapsed_seconds",
+                    "worker_index", "worker_count", "capacity_mode", "target_global",
+                    "target_worker", "attempted", "established", "establish_failed",
+                    "surviving", "survival_failed", "active_heartbeat_failures",
+                    "barrier_verification_failures", "ramp_elapsed_seconds",
+                    "established_per_second", "level_elapsed_seconds",
                 ],
             )
             latency_writer = csv.DictWriter(
@@ -284,74 +344,136 @@ class CapacityRunner:
 
             for level_index, global_target in enumerate(levels):
                 level_started = time.perf_counter()
-                worker_target = self.worker_share(global_target, self.args.worker_index, self.args.worker_count)
+                worker_target = self.worker_share(
+                    global_target, self.args.worker_index, self.args.worker_count
+                )
                 print(
                     f"worker={self.args.worker_index}/{self.args.worker_count} "
                     f"level={global_target} worker_target={worker_target} mode={self.args.capacity_mode}",
                     flush=True,
                 )
-                connections, latencies, establish_errors, ramp_elapsed = await self.open_level(worker_target)
-                established = len(connections)
-                survivors, survival_errors = await self.hold_level(connections)
-                surviving = len(survivors)
-
-                for latency in latencies:
-                    latency_writer.writerow(
-                        {
-                            "worker_index": self.args.worker_index,
-                            "target_global": global_target,
-                            "latency_ms": f"{latency:.6f}",
-                        }
+                connections: list[HeldConnection] = []
+                active_errors: Counter[str] = Counter()
+                barrier_errors: Counter[str] = Counter()
+                stop_heartbeats = asyncio.Event()
+                heartbeat_task: asyncio.Task[None] | None = None
+                if self.args.capacity_mode == "active":
+                    heartbeat_task = asyncio.create_task(
+                        self.maintain_connections(connections, stop_heartbeats, active_errors)
                     )
-                for phase, counter in (("establish", establish_errors), ("survival", survival_errors)):
-                    for error, count in sorted(counter.items()):
-                        errors_writer.writerow(
-                            {
-                                "worker_index": self.args.worker_index,
-                                "target_global": global_target,
-                                "phase": phase,
-                                "error": error,
-                                "count": count,
-                            }
+
+                try:
+                    latencies, establish_errors, ramp_elapsed = await self.open_level(
+                        worker_target, connections
+                    )
+                    # Barrier one: every process has attempted its assigned share.
+                    # Active heartbeats continue while faster processes wait here.
+                    await self.wait_for_coordinator(global_target, "ready")
+
+                    if self.args.capacity_mode == "active":
+                        # Stop the background heartbeat before the explicit checkpoint
+                        # so two tasks never read/write the same HTTP stream concurrently.
+                        stop_heartbeats.set()
+                        if heartbeat_task is not None:
+                            await heartbeat_task
+                            heartbeat_task = None
+                        checkpoint_snapshot = list(connections)
+                        checkpoint_survivors, barrier_errors = await self.verify_connections(
+                            checkpoint_snapshot
+                        )
+                        survivor_ids = {id(conn) for conn in checkpoint_survivors}
+                        for conn in checkpoint_snapshot:
+                            if id(conn) not in survivor_ids:
+                                try:
+                                    conn.writer.close()
+                                except Exception:
+                                    pass
+                        connections[:] = checkpoint_survivors
+                        # Resume active traffic while waiting for all peers to finish
+                        # their checkpoint. The live set may shrink during that wait.
+                        stop_heartbeats = asyncio.Event()
+                        heartbeat_task = asyncio.create_task(
+                            self.maintain_connections(connections, stop_heartbeats, active_errors)
                         )
 
-                summary_writer.writerow(
-                    {
+                    # Barrier two: all processes have completed the explicit checkpoint.
+                    # At release, active traffic remains live; idle mode still sends none.
+                    await self.wait_for_coordinator(global_target, "verified")
+                    established = len(connections)
+
+                    if self.args.capacity_mode == "active":
+                        await asyncio.sleep(self.args.hold_seconds)
+                        stop_heartbeats.set()
+                        if heartbeat_task is not None:
+                            await heartbeat_task
+                            heartbeat_task = None
+                        survivors = list(connections)
+                        survival_errors: Counter[str] = Counter()
+                    else:
+                        survivors, survival_errors = await self.hold_idle_level(connections)
+                finally:
+                    stop_heartbeats.set()
+                    if heartbeat_task is not None:
+                        try:
+                            await heartbeat_task
+                        except Exception:
+                            pass
+
+                surviving = len(survivors)
+                for latency in latencies:
+                    latency_writer.writerow({
                         "worker_index": self.args.worker_index,
-                        "worker_count": self.args.worker_count,
-                        "capacity_mode": self.args.capacity_mode,
                         "target_global": global_target,
-                        "target_worker": worker_target,
-                        "attempted": worker_target,
-                        "established": established,
-                        "establish_failed": worker_target - established,
-                        "surviving": surviving,
-                        "survival_failed": established - surviving,
-                        "ramp_elapsed_seconds": f"{ramp_elapsed:.6f}",
-                        "established_per_second": f"{(established / ramp_elapsed) if ramp_elapsed else 0:.6f}",
-                        "level_elapsed_seconds": f"{time.perf_counter() - level_started:.6f}",
-                    }
-                )
+                        "latency_ms": f"{latency:.6f}",
+                    })
+                for phase, counter in (
+                    ("establish", establish_errors),
+                    ("active_heartbeat", active_errors),
+                    ("barrier_verify", barrier_errors),
+                    ("survival", survival_errors),
+                ):
+                    for error, count in sorted(counter.items()):
+                        errors_writer.writerow({
+                            "worker_index": self.args.worker_index,
+                            "target_global": global_target,
+                            "phase": phase,
+                            "error": error,
+                            "count": count,
+                        })
+                summary_writer.writerow({
+                    "worker_index": self.args.worker_index,
+                    "worker_count": self.args.worker_count,
+                    "capacity_mode": self.args.capacity_mode,
+                    "target_global": global_target,
+                    "target_worker": worker_target,
+                    "attempted": worker_target,
+                    "established": established,
+                    "establish_failed": max(0, worker_target - established),
+                    "surviving": surviving,
+                    "survival_failed": max(0, established - surviving),
+                    "active_heartbeat_failures": sum(active_errors.values()),
+                    "barrier_verification_failures": sum(barrier_errors.values()),
+                    "ramp_elapsed_seconds": f"{ramp_elapsed:.6f}",
+                    "established_per_second": f"{(len(latencies) / ramp_elapsed) if ramp_elapsed else 0:.6f}",
+                    "level_elapsed_seconds": f"{time.perf_counter() - level_started:.6f}",
+                })
                 summary_file.flush()
                 latency_file.flush()
                 errors_file.flush()
 
                 await self.close_all(connections)
-
-                # Release prior-level objects before allocating the next
-                # level's connections.
                 connections.clear()
                 survivors.clear()
                 latencies.clear()
                 await asyncio.sleep(0)
-
-                if level_index + 1 < len(
-                        levels) and self.args.inter_level_cooldown_seconds > 0:
+                if level_index + 1 < len(levels) and self.args.inter_level_cooldown_seconds > 0:
                     await asyncio.sleep(self.args.inter_level_cooldown_seconds)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Distributed Octavia concurrent-connection capacity worker")
+    parser = argparse.ArgumentParser(
+        description="Distributed Octavia concurrent-connection capacity worker"
+    )
     parser.add_argument("--target-url", required=True)
     parser.add_argument("--path", default="/1024.bin")
     parser.add_argument("--capacity-mode", choices=["idle", "active"], required=True)
@@ -374,12 +496,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verify-idle-at-end", action="store_true")
     parser.add_argument("--skip-final-heartbeat", action="store_true")
     parser.add_argument("--tcp-nodelay", action="store_true")
+    parser.add_argument("--coordinator-host", default="")
+    parser.add_argument("--coordinator-port", type=int, default=5557)
+    parser.add_argument("--coordinator-run-id", default="")
+    parser.add_argument("--barrier-timeout-seconds", type=float, default=900.0)
+    parser.add_argument("--require-coordinator", action="store_true")
     args = parser.parse_args()
     args.levels = [int(x.strip()) for x in args.levels.split(",") if x.strip()]
     if not args.levels or any(x <= 0 for x in args.levels):
         parser.error("--levels must contain positive integers")
     if args.worker_count < 1 or not 0 <= args.worker_index < args.worker_count:
         parser.error("worker index/count are inconsistent")
+    if args.coordinator_host and not args.coordinator_run_id:
+        parser.error("--coordinator-run-id is required with --coordinator-host")
+    if not 1 <= args.coordinator_port <= 65535:
+        parser.error("--coordinator-port must be between 1 and 65535")
+    if args.barrier_timeout_seconds <= 0:
+        parser.error("--barrier-timeout-seconds must be > 0")
     for name in ("open_concurrency", "io_concurrency"):
         if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be >= 1")
@@ -403,6 +536,8 @@ async def amain() -> None:
             f"check_hostname={runner.ssl_context.check_hostname}",
             flush=True,
         )
+    if args.require_coordinator and not args.coordinator_host:
+        raise SystemExit("--require-coordinator requires --coordinator-host")
     await runner.run()
 
 
