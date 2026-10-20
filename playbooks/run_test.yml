@@ -235,6 +235,50 @@
         state: started
       become: true
       when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
+- name: Start compact capacity telemetry watchers
+  hosts: locust_workers
+  gather_facts: false
+  vars:
+    target: "{{ hostvars['runtime_target'].target_state }}"
+    remote_result_dir: "/var/lib/octavia-perf/results/{{ target.benchmark_id }}"
+    capacity_watch_port: "{{ target.listener_port | default(443) | int }}"
+    capacity_watch_pid_file: "/var/run/octavia-perf-capacity-watch-{{ target.benchmark_id }}.pid"
+  tasks:
+    - name: Install capacity telemetry watcher
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../scripts/capacity-watch-host.py"
+        dest: /opt/octavia-perf/capacity-watch-host.py
+        owner: root
+        group: root
+        mode: "0755"
+      become: true
+      when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
+    - name: Stop stale capacity telemetry watcher
+      ansible.builtin.shell: "pkill -f '[c]apacity-watch-host.py' || true"
+      changed_when: false
+      become: true
+      when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
+    - name: Start capacity telemetry watcher before connection ramp
+      ansible.builtin.shell: |
+        set -euo pipefail
+        pid_file={{ capacity_watch_pid_file | quote }}
+        output_file={{ (remote_result_dir + '/capacity-watch.csv') | quote }}
+        log_file={{ (remote_result_dir + '/capacity-watch.log') | quote }}
+        nohup /usr/bin/python3 /opt/octavia-perf/capacity-watch-host.py \
+          {{ target.target_host | quote }} \
+          --port {{ capacity_watch_port }} \
+          --out "$output_file" \
+          --interval 5 \
+          --log-dir {{ remote_result_dir | quote }} \
+          >"$log_file" 2>&1 </dev/null &
+        echo $! >"$pid_file"
+        sleep 1
+        kill -0 "$(cat "$pid_file")"
+      args:
+        executable: /bin/bash
+      changed_when: true
+      become: true
+      when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
 - name: Run distributed concurrent-connection capacity workers
   hosts: locust_workers
   gather_facts: false
@@ -405,6 +449,48 @@
       when:
         - inventory_hostname in groups['locust_workers']
         - (target.benchmark_engine | default('locust')) == 'connection_capacity'
+    - name: Stop capacity telemetry watcher after workers finish
+      ansible.builtin.shell: |
+        set -euo pipefail
+        pid_file={{ ('/var/run/octavia-perf-capacity-watch-' + target.benchmark_id + '.pid') | quote }}
+        if [ -s "$pid_file" ]; then
+          pid=$(cat "$pid_file")
+          if [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' <"/proc/$pid/cmdline" | grep -Fq /opt/octavia-perf/capacity-watch-host.py; then
+            kill "$pid" 2>/dev/null || true
+            for _ in $(seq 1 20); do
+              kill -0 "$pid" 2>/dev/null || break
+              sleep 0.1
+            done
+          fi
+          rm -f "$pid_file"
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: false
+      become: true
+      when:
+        - inventory_hostname in groups['locust_workers']
+        - (target.benchmark_engine | default('locust')) == 'connection_capacity'
+    - name: Fetch compact capacity telemetry CSV
+      ansible.builtin.fetch:
+        src: "{{ remote_result_dir }}/capacity-watch.csv"
+        dest: "{{ playbook_dir }}/../results/{{ target.benchmark_id }}/raw/{{ inventory_hostname }}/capacity-watch.csv"
+        flat: true
+        fail_on_missing: false
+      become: true
+      when:
+        - inventory_hostname in groups['locust_workers']
+        - (target.benchmark_engine | default('locust')) == 'connection_capacity'
+    - name: Fetch capacity telemetry watcher log
+      ansible.builtin.fetch:
+        src: "{{ remote_result_dir }}/capacity-watch.log"
+        dest: "{{ playbook_dir }}/../results/{{ target.benchmark_id }}/raw/{{ inventory_hostname }}/capacity-watch.log"
+        flat: true
+        fail_on_missing: false
+      become: true
+      when:
+        - inventory_hostname in groups['locust_workers']
+        - (target.benchmark_engine | default('locust')) == 'connection_capacity'
     - name: Collect capacity coordinator log before stopping coordinator
       ansible.builtin.fetch:
         src: "{{ remote_result_dir }}/capacity-coordinator.log"
@@ -467,6 +553,30 @@
         file_type: file
       register: collected_capacity_csvs
       when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
+    - name: Generate concise capacity telemetry summary
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ playbook_dir }}/../scripts/summarize_capacity_watch.py"
+          - "{{ local_raw_dir }}"
+          - --expected-hosts
+          - "{{ groups['locust_workers'] | length | string }}"
+          - --vip
+          - "{{ target.target_host }}:{{ target.listener_port | default(443) | int }}"
+          - --output
+          - "{{ playbook_dir }}/../results/{{ target.benchmark_id }}/capacity-watch-summary.txt"
+      register: capacity_telemetry_summary
+      changed_when: capacity_telemetry_summary.rc == 0
+      failed_when: false
+      when: (target.benchmark_engine | default('locust')) == 'connection_capacity'
+    - name: Print capacity telemetry summary location
+      ansible.builtin.debug:
+        msg: >-
+          Capacity telemetry summary: {{ playbook_dir }}/../results/{{ target.benchmark_id }}/capacity-watch-summary.txt.
+          {{ capacity_telemetry_summary.stdout | default('Telemetry summary was unavailable; inspect raw/*/capacity-watch.log.') }}
+      when:
+        - (target.benchmark_engine | default('locust')) == 'connection_capacity'
+        - capacity_telemetry_summary is defined
     - name: Require complete distributed connection-capacity measurements
       ansible.builtin.assert:
         that:

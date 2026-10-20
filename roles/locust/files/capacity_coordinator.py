@@ -1,4 +1,4 @@
-connection_capacity.py#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Small TCP barrier coordinator for distributed connection-capacity tests."""
 from __future__ import annotations
 
